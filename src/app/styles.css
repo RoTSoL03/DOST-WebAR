@@ -283,10 +283,15 @@ button {
 
 .camera-feed {
   object-fit: cover;
+  z-index: 0;
 }
 
 .camera-model-layer {
-  pointer-events: none;
+  z-index: 1;
+  display: block;
+  background: transparent;
+  pointer-events: auto;
+  touch-action: none;
 }
 
 .camera-placement-target {
@@ -375,9 +380,25 @@ button {
 .webxr-overlay-controls {
   position: fixed;
   inset: 0;
+  z-index: 2;
   overflow: hidden;
   background: transparent;
   pointer-events: none;
+}
+
+.camera-end-button {
+  position: absolute;
+  top: max(14px, env(safe-area-inset-top));
+  left: max(14px, env(safe-area-inset-left));
+  min-height: 42px;
+  border: 0;
+  border-radius: 8px;
+  padding: 0 14px;
+  color: #f7fbff;
+  background: rgba(4, 12, 15, 0.72);
+  font-weight: 900;
+  pointer-events: auto;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.28);
 }
 
 .webxr-mascot-picker {

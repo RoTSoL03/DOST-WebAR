@@ -36,7 +36,7 @@ describe("detectCapabilities", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("recommends unsupported on iOS while the prototype is Android-only", async () => {
+  it("recommends camera composition on iOS when WebXR AR is unavailable", async () => {
     const getUserMedia = vi.fn();
 
     const result = await detectCapabilities({
@@ -51,7 +51,7 @@ describe("detectCapabilities", () => {
       } as unknown as Navigator
     });
 
-    expect(result.runtimeRecommendation).toBe("unsupported");
+    expect(result.runtimeRecommendation).toBe("camera-composition");
     expect(result.webXRAvailable).toBe(false);
     expect(getUserMedia).not.toHaveBeenCalled();
   });

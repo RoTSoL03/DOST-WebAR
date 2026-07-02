@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 
 import { mascotManifest } from "../config/mascots";
 import { createCapabilityCheckError, type UserFacingError } from "../errors/userFacingError";
@@ -53,8 +53,6 @@ export function App({
       mounted = false;
     };
   }, [applyCapabilities, beginCapabilityCheck, detectCapabilitiesFn, setError]);
-
-  const defaultMascot = useMemo(() => getDefaultMascot(), []);
 
   const startAR = async () => {
     if (runtimeKind === "webxr") {
@@ -166,7 +164,7 @@ export function App({
   ) {
     return (
       <Suspense fallback={<div className="camera-loading">Loading AR...</div>}>
-        <CameraARSession mascot={defaultMascot} stream={cameraStream} onEnd={endCameraAR} />
+        <CameraARSession mascots={mascotManifest} stream={cameraStream} onEnd={endCameraAR} />
       </Suspense>
     );
   }
@@ -363,16 +361,6 @@ function ReadyScreen({
 
 function canAttemptWebXR() {
   return typeof navigator.xr?.requestSession === "function";
-}
-
-function getDefaultMascot() {
-  const mascot = mascotManifest[0];
-
-  if (!mascot) {
-    throw new Error("At least one mascot must be configured.");
-  }
-
-  return mascot;
 }
 
 function createCameraError(message: string): UserFacingError {

@@ -92,10 +92,6 @@ export function recommendRuntime(
     return "webxr";
   }
 
-  if (capabilities.osFamily === "ios") {
-    return "unsupported";
-  }
-
   if (capabilities.cameraApiAvailable) {
     return "camera-composition";
   }

@@ -15,6 +15,16 @@ vi.mock("../ar/WebXRSession", () => ({
   )
 }));
 
+vi.mock("../ar/CameraARSession", () => ({
+  CameraARSession: ({ onEnd }: { onEnd: () => void }) => (
+    <div data-testid="camera-ar-session">
+      <button type="button" onClick={onEnd}>
+        End Camera
+      </button>
+    </div>
+  )
+}));
+
 const mobileCameraCapabilities: CapabilityResult = {
   isMobile: true,
   webGL2Available: true,
@@ -26,7 +36,7 @@ const mobileCameraCapabilities: CapabilityResult = {
   nativeShareAvailable: true,
   browserFamily: "safari",
   osFamily: "ios",
-  runtimeRecommendation: "unsupported"
+  runtimeRecommendation: "camera-composition"
 };
 
 const androidCameraCapabilities: CapabilityResult = {
@@ -120,8 +130,9 @@ describe("App", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("shows the Android-only unsupported screen on iOS", async () => {
-    const getUserMedia = vi.fn();
+  it("starts the iOS camera composition session from the ready screen", async () => {
+    const stream = { getTracks: vi.fn(() => []) } as unknown as MediaStream;
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
     Object.defineProperty(globalThis.navigator, "mediaDevices", {
       configurable: true,
       value: { getUserMedia }
@@ -130,14 +141,25 @@ describe("App", () => {
       configurable: true,
       value: undefined
     });
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: true
+    });
 
+    const user = userEvent.setup();
     await renderAppWithCapabilities(mobileCameraCapabilities);
 
-    expect(await screen.findByTestId("unsupported-screen")).toBeInTheDocument();
-    expect(
-      screen.getByRole("heading", { name: "This prototype is available on Android Chrome" })
-    ).toBeInTheDocument();
-    expect(getUserMedia).not.toHaveBeenCalled();
+    await user.click(await screen.findByRole("button", { name: "Start Experience" }));
+
+    expect(getUserMedia).toHaveBeenCalledWith({
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    });
+    expect(await screen.findByTestId("camera-ar-session")).toBeInTheDocument();
   });
 
   it("starts WebXR from the ready screen without requesting camera fallback media", async () => {
