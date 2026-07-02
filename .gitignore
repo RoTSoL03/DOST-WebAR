@@ -1,0 +1,7 @@
+node_modules
+dist
+coverage
+.vite
+*.local
+*.tsbuildinfo
+node_modules/.tmp

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="DOST WebAR">
+  <rect width="64" height="64" rx="12" fill="#071014" />
+  <circle cx="32" cy="26" r="16" fill="#8ee4d1" />
+  <path d="M16 52c4-10 12-16 16-16s12 6 16 16" fill="#ffdf6e" />
+</svg>
