@@ -140,7 +140,7 @@ describe("App", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("starts the iOS Quick Look session from the ready screen", async () => {
+  it("renders iOS Start Experience as a direct Quick Look AR link", async () => {
     const getUserMedia = vi.fn();
     const requestSession = vi.fn();
     Object.defineProperty(globalThis.navigator, "mediaDevices", {
@@ -152,14 +152,16 @@ describe("App", () => {
       value: { requestSession }
     });
 
-    const user = userEvent.setup();
     await renderAppWithCapabilities(mobileCameraCapabilities);
 
-    await user.click(await screen.findByRole("button", { name: "Start Experience" }));
+    const quickLookLink = await screen.findByRole("link", { name: "Start Experience" });
 
+    expect(quickLookLink).toHaveAttribute("href", "/models/mascot_solido.usdz");
+    expect(quickLookLink).toHaveAttribute("rel", "ar");
+    expect(quickLookLink.querySelector("img")).toBeInTheDocument();
+    expect(screen.queryByTestId("quick-look-session")).not.toBeInTheDocument();
     expect(requestSession).not.toHaveBeenCalled();
     expect(getUserMedia).not.toHaveBeenCalled();
-    expect(await screen.findByTestId("quick-look-session")).toBeInTheDocument();
   });
 
   it("starts WebXR from the ready screen without requesting camera fallback media", async () => {

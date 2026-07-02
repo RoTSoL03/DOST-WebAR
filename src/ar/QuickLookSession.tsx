@@ -47,6 +47,12 @@ export function QuickLookSession({ mascots, onEnd }: QuickLookSessionProps) {
                 style={getMascotButtonStyle(entry.id)}
                 onClick={() => handleMascotLaunch(entry.id)}
               >
+                <img
+                  className="quick-look-ar-preview"
+                  src={entry.thumbnailUrl}
+                  alt=""
+                  draggable="false"
+                />
                 <span className="webxr-mascot-avatar" aria-hidden="true">
                   <img src={entry.thumbnailUrl} alt="" draggable="false" />
                 </span>

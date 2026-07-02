@@ -135,6 +135,7 @@ button {
 }
 
 .home-start-button {
+  position: relative;
   width: min(100%, 360px);
   min-height: 56px;
   border: 2px solid rgba(255, 255, 255, 0.74);
@@ -142,6 +143,12 @@ button {
   background: linear-gradient(135deg, #ffdf6e, #ff8a1c);
   box-shadow: 0 16px 34px rgba(0, 0, 0, 0.36);
   text-transform: uppercase;
+}
+
+.home-start-link {
+  display: inline-grid;
+  place-items: center;
+  text-decoration: none;
 }
 
 .screen-state {
@@ -275,16 +282,22 @@ button {
 .quick-look-stage {
   position: absolute;
   inset: 0;
-  background:
-    linear-gradient(180deg, rgba(2, 7, 37, 0.08), rgba(2, 7, 37, 0.56)),
-    url("/images/resilient-four-home.png") center / cover no-repeat,
-    #020725;
+  background: #020725;
 }
 
 .quick-look-mascot-choice {
+  position: relative;
   text-decoration: none;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
+}
+
+.quick-look-ar-preview {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .quick-look-mascot-choice[data-active="true"] {
