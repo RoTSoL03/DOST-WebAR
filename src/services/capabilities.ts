@@ -92,6 +92,10 @@ export function recommendRuntime(
     return "webxr";
   }
 
+  if (capabilities.osFamily === "ios") {
+    return "quick-look";
+  }
+
   if (capabilities.cameraApiAvailable) {
     return "camera-composition";
   }

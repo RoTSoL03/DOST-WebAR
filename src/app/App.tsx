@@ -9,6 +9,10 @@ const CameraARSession = lazy(() =>
   import("../ar/CameraARSession").then((module) => ({ default: module.CameraARSession }))
 );
 
+const QuickLookSession = lazy(() =>
+  import("../ar/QuickLookSession").then((module) => ({ default: module.QuickLookSession }))
+);
+
 const WebXRSession = lazy(() =>
   import("../ar/WebXRSession").then((module) => ({ default: module.WebXRSession }))
 );
@@ -57,6 +61,11 @@ export function App({
   const startAR = async () => {
     if (runtimeKind === "webxr") {
       await startWebXR();
+      return;
+    }
+
+    if (runtimeKind === "quick-look") {
+      startQuickLook();
       return;
     }
 
@@ -119,6 +128,10 @@ export function App({
     }
   };
 
+  const startQuickLook = () => {
+    startRuntime();
+  };
+
   const endCameraAR = () => {
     cameraStream?.getTracks().forEach((track) => track.stop());
     setCameraStream(null);
@@ -152,6 +165,14 @@ export function App({
           onEnd={endWebXR}
           onError={handleWebXRError}
         />
+      </Suspense>
+    );
+  }
+
+  if (isActiveRuntimeStatus(sessionStatus) && runtimeKind === "quick-look") {
+    return (
+      <Suspense fallback={<div className="camera-loading">Loading AR...</div>}>
+        <QuickLookSession mascots={mascotManifest} onEnd={endSession} />
       </Suspense>
     );
   }
@@ -202,7 +223,7 @@ export function App({
         {sessionStatus === "readyToStart" ? (
           <ReadyScreen
             onStartAR={startAR}
-            canAttemptWebXR={canAttemptWebXR()}
+            canAttemptWebXR={runtimeKind !== "quick-look" && canAttemptWebXR()}
             onStartWebXR={startWebXR}
           />
         ) : null}

@@ -265,6 +265,33 @@ button {
   background: #000000;
 }
 
+.quick-look-session {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: #020725;
+}
+
+.quick-look-stage {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(180deg, rgba(2, 7, 37, 0.08), rgba(2, 7, 37, 0.56)),
+    url("/images/resilient-four-home.png") center / cover no-repeat,
+    #020725;
+}
+
+.quick-look-mascot-choice {
+  text-decoration: none;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.quick-look-mascot-choice[data-active="true"] {
+  border-color: var(--mascot-accent, #ffdf6e);
+  outline: 2px solid color-mix(in srgb, var(--mascot-accent, #ffdf6e) 58%, transparent);
+}
+
 .camera-loading {
   min-height: 100svh;
   display: grid;

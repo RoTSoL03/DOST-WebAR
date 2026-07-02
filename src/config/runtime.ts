@@ -1,4 +1,4 @@
-export type RuntimeKind = "webxr" | "camera-composition" | "unsupported";
+export type RuntimeKind = "webxr" | "camera-composition" | "quick-look" | "unsupported";
 
 export const SESSION_STATUSES = [
   "idle",
