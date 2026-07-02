@@ -143,6 +143,21 @@ button {
   text-transform: uppercase;
 }
 
+.home-start-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
+.quick-look-ar-preview {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0.001;
+  pointer-events: none;
+}
+
 .screen-state {
   display: grid;
   gap: 18px;
@@ -291,34 +306,6 @@ button {
   background: transparent;
   pointer-events: auto;
   touch-action: none;
-}
-
-.image-tracking-session {
-  position: fixed;
-  inset: 0;
-  overflow: hidden;
-  background: #000000;
-}
-
-.image-tracking-viewport {
-  position: absolute;
-  inset: 0;
-  overflow: hidden;
-  background: #000000;
-  touch-action: none;
-}
-
-.image-tracking-viewport canvas,
-.image-tracking-viewport video {
-  position: absolute;
-}
-
-.image-tracking-video {
-  object-fit: cover;
-}
-
-.image-tracking-canvas {
-  pointer-events: none;
 }
 
 .camera-placement-target {

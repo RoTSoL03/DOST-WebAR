@@ -25,16 +25,6 @@ vi.mock("../ar/CameraARSession", () => ({
   )
 }));
 
-vi.mock("../ar/ImageTrackingSession", () => ({
-  ImageTrackingSession: ({ onEnd }: { onEnd: () => void }) => (
-    <div data-testid="image-tracking-session">
-      <button type="button" onClick={onEnd}>
-        End Image Tracking
-      </button>
-    </div>
-  )
-}));
-
 const mobileCameraCapabilities: CapabilityResult = {
   isMobile: true,
   webGL2Available: true,
@@ -46,7 +36,7 @@ const mobileCameraCapabilities: CapabilityResult = {
   nativeShareAvailable: true,
   browserFamily: "safari",
   osFamily: "ios",
-  runtimeRecommendation: "image-tracking"
+  runtimeRecommendation: "quick-look"
 };
 
 const androidCameraCapabilities: CapabilityResult = {
@@ -140,7 +130,7 @@ describe("App", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("starts the iOS image tracking session from the ready screen", async () => {
+  it("renders the iOS Quick Look launcher from the ready screen", async () => {
     const getUserMedia = vi.fn();
     Object.defineProperty(globalThis.navigator, "mediaDevices", {
       configurable: true,
@@ -155,13 +145,15 @@ describe("App", () => {
       value: true
     });
 
-    const user = userEvent.setup();
     await renderAppWithCapabilities(mobileCameraCapabilities);
 
-    await user.click(await screen.findByRole("button", { name: "Start Experience" }));
+    const quickLookLink = await screen.findByRole("link", { name: "Start Experience" });
 
+    expect(quickLookLink).toHaveAttribute("href", "/models/resilient_four.usdz");
+    expect(quickLookLink).toHaveAttribute("rel", "ar");
     expect(getUserMedia).not.toHaveBeenCalled();
-    expect(await screen.findByTestId("image-tracking-session")).toBeInTheDocument();
+    expect(screen.queryByTestId("camera-ar-session")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("webxr-session")).not.toBeInTheDocument();
   });
 
   it("starts WebXR from the ready screen without requesting camera fallback media", async () => {

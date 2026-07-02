@@ -9,10 +9,6 @@ const CameraARSession = lazy(() =>
   import("../ar/CameraARSession").then((module) => ({ default: module.CameraARSession }))
 );
 
-const ImageTrackingSession = lazy(() =>
-  import("../ar/ImageTrackingSession").then((module) => ({ default: module.ImageTrackingSession }))
-);
-
 const WebXRSession = lazy(() =>
   import("../ar/WebXRSession").then((module) => ({ default: module.WebXRSession }))
 );
@@ -62,29 +58,11 @@ export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
       return;
     }
 
-    if (runtimeKind === "image-tracking") {
-      startImageTracking();
+    if (runtimeKind === "quick-look") {
       return;
     }
 
     await startCameraAR();
-  };
-
-  const startImageTracking = () => {
-    if (!window.isSecureContext) {
-      setError(
-        createImageTrackingError("Image tracking requires HTTPS on phones. Open the HTTPS LAN URL.")
-      );
-      return;
-    }
-
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setError(createImageTrackingError("This browser does not expose camera access."));
-      return;
-    }
-
-    requestPermission();
-    startRuntime();
   };
 
   const startWebXR = async () => {
@@ -163,26 +141,6 @@ export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
     [setError]
   );
 
-  const handleImageTrackingError = useCallback(
-    (message: string) => {
-      setError(createImageTrackingError(message));
-    },
-    [setError]
-  );
-
-  if (isActiveRuntimeStatus(sessionStatus) && runtimeKind === "image-tracking") {
-    return (
-      <Suspense fallback={<div className="camera-loading">Loading AR...</div>}>
-        <ImageTrackingSession
-          mascots={mascotManifest}
-          imageTargetSrc="/targets/mindar-card.mind"
-          onEnd={endSession}
-          onError={handleImageTrackingError}
-        />
-      </Suspense>
-    );
-  }
-
   if (isActiveRuntimeStatus(sessionStatus) && xrSession) {
     return (
       <Suspense fallback={<div className="camera-loading">Loading AR...</div>}>
@@ -245,6 +203,7 @@ export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
             onStartAR={startAR}
             canAttemptWebXR={canAttemptWebXR(runtimeKind)}
             onStartWebXR={startWebXR}
+            quickLookUrl={runtimeKind === "quick-look" ? RESILIENT_FOUR_QUICK_LOOK_URL : null}
           />
         ) : null}
 
@@ -377,12 +336,34 @@ function UnsupportedScreen({ osFamily }: { osFamily: CapabilityResult["osFamily"
 function ReadyScreen({
   onStartAR,
   canAttemptWebXR,
-  onStartWebXR
+  onStartWebXR,
+  quickLookUrl
 }: {
   onStartAR: () => void;
   canAttemptWebXR: boolean;
   onStartWebXR: () => void;
+  quickLookUrl: string | null;
 }) {
+  if (quickLookUrl) {
+    return (
+      <div className="home-ready-screen" data-testid="ready-screen">
+        <a
+          className="primary-action home-start-button home-start-link"
+          href={quickLookUrl}
+          rel="ar"
+        >
+          <img
+            className="quick-look-ar-preview"
+            src={QUICK_LOOK_PREVIEW_IMAGE_URL}
+            alt=""
+            draggable="false"
+          />
+          <span>Start Experience</span>
+        </a>
+      </div>
+    );
+  }
+
   return (
     <div className="home-ready-screen" data-testid="ready-screen">
       <button
@@ -397,7 +378,7 @@ function ReadyScreen({
 }
 
 function canAttemptWebXR(runtimeKind: ReturnType<typeof useSessionStore.getState>["runtimeKind"]) {
-  return runtimeKind !== "image-tracking" && typeof navigator.xr?.requestSession === "function";
+  return runtimeKind !== "quick-look" && typeof navigator.xr?.requestSession === "function";
 }
 
 function createCameraError(message: string): UserFacingError {
@@ -418,15 +399,6 @@ function createWebXRError(message: string): UserFacingError {
   };
 }
 
-function createImageTrackingError(message: string): UserFacingError {
-  return {
-    code: "runtime-start-failed",
-    title: "Image tracking unavailable",
-    message,
-    recoverable: true
-  };
-}
-
 function ErrorScreen() {
   const error = useSessionStore((state) => state.error);
   const clearError = useSessionStore((state) => state.clearError);
@@ -441,3 +413,6 @@ function ErrorScreen() {
     </div>
   );
 }
+
+const RESILIENT_FOUR_QUICK_LOOK_URL = "/models/resilient_four.usdz";
+const QUICK_LOOK_PREVIEW_IMAGE_URL = "/icons/mascot-alpha.png";

@@ -10,7 +10,8 @@
     "test": "vitest run --config vitest.config.ts",
     "test:watch": "vitest --config vitest.config.ts",
     "lint": "eslint .",
-    "format": "prettier --check ."
+    "format": "prettier --check .",
+    "build:usdz": "python scripts/build_resilient_four_usdz.py"
   },
   "dependencies": {
     "react": "^18.3.1",

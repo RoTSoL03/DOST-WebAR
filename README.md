@@ -16,8 +16,8 @@ The product requirements document at `docs/PRD.md` and stakeholder clarification
 ## Key MVP Decisions
 
 - Android Chrome WebXR markerless floor scanning for the prototype.
-- iOS Safari MindAR image tracking for the prototype.
-- No Quick Look in MVP.
+- iOS Safari Quick Look for the grouped Resilient Four scene.
+- Quick Look is used for the iOS grouped-scene prototype path.
 - No native app download.
 - No commercial WebAR SDK in MVP.
 - No photo upload or server-side image processing.
@@ -56,7 +56,7 @@ vercel --prod
 Testers should open the Vercel HTTPS URL on a mobile device:
 
 - Android: use Chrome on an ARCore-capable phone for WebXR floor scanning.
-- iOS: use Safari and scan the target image at `public/targets/mindar-card.png` for image-tracked mascot placement.
+- iOS: use Safari to open `public/models/resilient_four.usdz` in AR Quick Look.
 
 Desktop browsers show the mobile-device fallback screen.
 
