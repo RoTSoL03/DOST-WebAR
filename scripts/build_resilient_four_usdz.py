@@ -18,6 +18,8 @@ class MascotLayer:
     layer_name: str
     prim_name: str
     translate_x: float
+    stand_rotation_x: float = -90
+    face_rotation_y: float = -90
 
 
 MASCOT_LAYERS = (
@@ -81,12 +83,19 @@ def Xform "ResilientFour" (
 
 
 def create_mascot_prim(mascot: MascotLayer) -> str:
-    return f"""    def Xform "{mascot.prim_name}" (
-        prepend references = @{mascot.layer_name}@
-    )
+    return f"""    def Xform "{mascot.prim_name}"
     {{
         double3 xformOp:translate = ({mascot.translate_x}, 0, 0)
         uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Xform "Model" (
+            prepend references = @{mascot.layer_name}@
+        )
+        {{
+            float xformOp:rotateX:stand = {mascot.stand_rotation_x}
+            float xformOp:rotateY:face = {mascot.face_rotation_y}
+            uniform token[] xformOpOrder = ["xformOp:rotateX:stand", "xformOp:rotateY:face"]
+        }}
     }}"""
 
 

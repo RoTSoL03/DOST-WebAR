@@ -132,8 +132,7 @@ export function WebXRSession({
   const [loadedMascotIds, setLoadedMascotIds] = useState<MascotId[]>([]);
   const [placedMascotIds, setPlacedMascotIds] = useState<MascotId[]>([]);
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("idle");
-  const [cameraCaptureState, setCameraCaptureState] =
-    useState<CameraCaptureState>("checking");
+  const [cameraCaptureState, setCameraCaptureState] = useState<CameraCaptureState>("checking");
   const [captureFailureReason, setCaptureFailureReason] = useState<CaptureFailureReason | null>(
     null
   );
@@ -252,9 +251,10 @@ export function WebXRSession({
         mascots.forEach((manifestEntry) => {
           const root = new Group();
           const model = new Group();
+          const contactShadow = createMascotContactShadow();
           root.visible = false;
           root.matrixAutoUpdate = false;
-          root.add(model);
+          root.add(contactShadow, model);
           scene.add(root);
           mascotRuntimes.set(manifestEntry.id, {
             mascot: manifestEntry,
@@ -290,11 +290,7 @@ export function WebXRSession({
             }
 
             runtime.model.add(gltf.scene);
-            alignModelBottomToFloor(
-              runtime.model,
-              manifestEntry,
-              WEBXR_MODEL_TARGET_HEIGHT_METERS
-            );
+            alignModelBottomToFloor(runtime.model, manifestEntry, WEBXR_MODEL_TARGET_HEIGHT_METERS);
             applyMascotForwardCorrection(runtime.model);
 
             const firstAnimation = gltf.animations[0];
@@ -443,14 +439,16 @@ export function WebXRSession({
               surfacePreview.matrix.fromArray(pose.transform.matrix);
               updateSurfacePatchFade(surfacePreview, frameTime - surfacePreviewStartedAt);
               markObjectMatrixDirty(surfacePreview);
-              if (sampleScannedSurfacePatch(
-                scannedSurfaces,
-                pose.transform.matrix,
-                frameTime,
-                surfaceSamplePosition,
-                lastSurfaceSamplePosition,
-                lastSurfaceSampleTime
-              )) {
+              if (
+                sampleScannedSurfacePatch(
+                  scannedSurfaces,
+                  pose.transform.matrix,
+                  frameTime,
+                  surfaceSamplePosition,
+                  lastSurfaceSamplePosition,
+                  lastSurfaceSampleTime
+                )
+              ) {
                 lastSurfaceSampleTime = frameTime;
               }
               updateSurfaceState(true);
@@ -565,7 +563,9 @@ export function WebXRSession({
           setStatus("error");
           onError(
             `WebXR scanner failed while ${startupStep}. ${
-              error instanceof Error ? error.message : "Try Android Chrome on an ARCore-capable phone over HTTPS."
+              error instanceof Error
+                ? error.message
+                : "Try Android Chrome on an ARCore-capable phone over HTTPS."
             }`
           );
         }
@@ -742,11 +742,7 @@ export function WebXRSession({
 
   return (
     <section className="webxr-session" data-testid="webxr-session">
-      <canvas
-        ref={canvasRef}
-        className="webxr-canvas"
-        aria-label="WebXR surface scanner"
-      />
+      <canvas ref={canvasRef} className="webxr-canvas" aria-label="WebXR surface scanner" />
       {domOverlayRoot ? createPortal(overlayControls, domOverlayRoot) : overlayControls}
     </section>
   );
@@ -781,7 +777,10 @@ function getMascotAccentColor(mascotId: MascotId) {
   }
 }
 
-function getCaptureButtonLabel(captureStatus: CaptureStatus, cameraCaptureState: CameraCaptureState) {
+function getCaptureButtonLabel(
+  captureStatus: CaptureStatus,
+  cameraCaptureState: CameraCaptureState
+) {
   if (cameraCaptureState === "checking") {
     return "Preparing Capture...";
   }
@@ -841,9 +840,10 @@ function createReticle() {
 
 function createSurfacePatch(fillOpacity: number, lineOpacity: number) {
   const patch = new Group();
-  const fillGeometry = new PlaneGeometry(SURFACE_PATCH_SIZE_METERS, SURFACE_PATCH_SIZE_METERS).rotateX(
-    -Math.PI / 2
-  );
+  const fillGeometry = new PlaneGeometry(
+    SURFACE_PATCH_SIZE_METERS,
+    SURFACE_PATCH_SIZE_METERS
+  ).rotateX(-Math.PI / 2);
   const fillMaterial = new MeshBasicMaterial({
     color: 0x35f3cf,
     side: DoubleSide,
@@ -870,6 +870,23 @@ function createSurfacePatch(fillOpacity: number, lineOpacity: number) {
   patch.userData.lineOpacity = lineOpacity;
 
   return patch;
+}
+
+function createMascotContactShadow() {
+  const geometry = new CircleGeometry(1, 64).rotateX(-Math.PI / 2);
+  const material = new MeshBasicMaterial({
+    color: 0x000000,
+    transparent: true,
+    opacity: 0.28,
+    depthWrite: false
+  });
+  const shadow = new Mesh(geometry, material);
+
+  shadow.position.y = 0.006;
+  shadow.scale.set(WEBXR_SHADOW_RADIUS_X_METERS, 1, WEBXR_SHADOW_RADIUS_Z_METERS);
+  shadow.renderOrder = -1;
+
+  return shadow;
 }
 
 function sampleScannedSurfacePatch(
@@ -1133,13 +1150,7 @@ function readRawCameraImage(
     const pixels = new Uint8Array(width * height * 4);
     gl.bindTexture(gl.TEXTURE_2D, cameraTexture);
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-    gl.framebufferTexture2D(
-      gl.FRAMEBUFFER,
-      gl.COLOR_ATTACHMENT0,
-      gl.TEXTURE_2D,
-      cameraTexture,
-      0
-    );
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, cameraTexture, 0);
 
     if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
       return { image: null, failureReason: "Camera framebuffer incomplete" };
@@ -1302,10 +1313,7 @@ function createCaptureError(reason: CaptureFailureReason) {
 }
 
 function getCaptureFailureReason(error: unknown): CaptureFailureReason {
-  if (
-    error instanceof Error &&
-    isCaptureFailureReason(error.message)
-  ) {
+  if (error instanceof Error && isCaptureFailureReason(error.message)) {
     return error.message;
   }
 
@@ -1317,10 +1325,7 @@ function isCaptureFailureReason(reason: string): reason is CaptureFailureReason 
 }
 
 function shouldRetryCapture(reason: CaptureFailureReason, attemptCount: number) {
-  return (
-    attemptCount < CAPTURE_RETRY_FRAME_LIMIT &&
-    reason !== "Capture image encoding failed"
-  );
+  return attemptCount < CAPTURE_RETRY_FRAME_LIMIT && reason !== "Capture image encoding failed";
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement) {
@@ -1412,6 +1417,8 @@ const CAMERA_READBACK_PROBE_FRAME_LIMIT = 90;
 const CAMERA_READY_FRAME_THRESHOLD = 4;
 const CAPTURE_RETRY_FRAME_LIMIT = 45;
 const WEBXR_MODEL_TARGET_HEIGHT_METERS = 1.4;
+const WEBXR_SHADOW_RADIUS_X_METERS = 0.38;
+const WEBXR_SHADOW_RADIUS_Z_METERS = 0.24;
 const MASCOT_FORWARD_YAW_OFFSET = -Math.PI / 2;
 const CAPTURE_FAILURE_REASONS: readonly CaptureFailureReason[] = [
   "Camera view missing",
