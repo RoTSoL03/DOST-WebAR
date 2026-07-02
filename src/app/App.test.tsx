@@ -25,16 +25,6 @@ vi.mock("../ar/CameraARSession", () => ({
   )
 }));
 
-vi.mock("../ar/QuickLookSession", () => ({
-  QuickLookSession: ({ onEnd }: { onEnd: () => void }) => (
-    <div data-testid="quick-look-session">
-      <button type="button" onClick={onEnd}>
-        End Quick Look
-      </button>
-    </div>
-  )
-}));
-
 const mobileCameraCapabilities: CapabilityResult = {
   isMobile: true,
   webGL2Available: true,
@@ -46,7 +36,7 @@ const mobileCameraCapabilities: CapabilityResult = {
   nativeShareAvailable: true,
   browserFamily: "safari",
   osFamily: "ios",
-  runtimeRecommendation: "quick-look"
+  runtimeRecommendation: "camera-composition"
 };
 
 const androidCameraCapabilities: CapabilityResult = {
@@ -140,28 +130,36 @@ describe("App", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("renders iOS Start Experience as a direct Quick Look AR link", async () => {
-    const getUserMedia = vi.fn();
-    const requestSession = vi.fn();
+  it("starts the iOS camera composition session from the ready screen", async () => {
+    const stream = { getTracks: vi.fn(() => []) } as unknown as MediaStream;
+    const getUserMedia = vi.fn().mockResolvedValue(stream);
     Object.defineProperty(globalThis.navigator, "mediaDevices", {
       configurable: true,
       value: { getUserMedia }
     });
     Object.defineProperty(globalThis.navigator, "xr", {
       configurable: true,
-      value: { requestSession }
+      value: undefined
+    });
+    Object.defineProperty(window, "isSecureContext", {
+      configurable: true,
+      value: true
     });
 
+    const user = userEvent.setup();
     await renderAppWithCapabilities(mobileCameraCapabilities);
 
-    const quickLookLink = await screen.findByRole("link", { name: "Start Experience" });
+    await user.click(await screen.findByRole("button", { name: "Start Experience" }));
 
-    expect(quickLookLink).toHaveAttribute("href", "/models/mascot_solido.usdz");
-    expect(quickLookLink).toHaveAttribute("rel", "ar");
-    expect(quickLookLink.querySelector("img")).toBeInTheDocument();
-    expect(screen.queryByTestId("quick-look-session")).not.toBeInTheDocument();
-    expect(requestSession).not.toHaveBeenCalled();
-    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(getUserMedia).toHaveBeenCalledWith({
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    });
+    expect(await screen.findByTestId("camera-ar-session")).toBeInTheDocument();
   });
 
   it("starts WebXR from the ready screen without requesting camera fallback media", async () => {

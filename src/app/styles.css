@@ -145,12 +145,6 @@ button {
   text-transform: uppercase;
 }
 
-.home-start-link {
-  display: inline-grid;
-  place-items: center;
-  text-decoration: none;
-}
-
 .screen-state {
   display: grid;
   gap: 18px;
@@ -270,39 +264,6 @@ button {
   inset: 0;
   overflow: hidden;
   background: #000000;
-}
-
-.quick-look-session {
-  position: fixed;
-  inset: 0;
-  overflow: hidden;
-  background: #020725;
-}
-
-.quick-look-stage {
-  position: absolute;
-  inset: 0;
-  background: #020725;
-}
-
-.quick-look-mascot-choice {
-  position: relative;
-  text-decoration: none;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
-}
-
-.quick-look-ar-preview {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-  pointer-events: none;
-}
-
-.quick-look-mascot-choice[data-active="true"] {
-  border-color: var(--mascot-accent, #ffdf6e);
-  outline: 2px solid color-mix(in srgb, var(--mascot-accent, #ffdf6e) 58%, transparent);
 }
 
 .camera-loading {

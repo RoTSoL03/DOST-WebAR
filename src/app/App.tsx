@@ -1,16 +1,12 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 
-import { mascotManifest, type MascotManifestEntry } from "../config/mascots";
+import { mascotManifest } from "../config/mascots";
 import { createCapabilityCheckError, type UserFacingError } from "../errors/userFacingError";
 import { detectCapabilities, type CapabilityResult } from "../services/capabilities";
 import { useSessionStore } from "../state/sessionStore";
 
 const CameraARSession = lazy(() =>
   import("../ar/CameraARSession").then((module) => ({ default: module.CameraARSession }))
-);
-
-const QuickLookSession = lazy(() =>
-  import("../ar/QuickLookSession").then((module) => ({ default: module.QuickLookSession }))
 );
 
 const WebXRSession = lazy(() =>
@@ -61,11 +57,6 @@ export function App({
   const startAR = async () => {
     if (runtimeKind === "webxr") {
       await startWebXR();
-      return;
-    }
-
-    if (runtimeKind === "quick-look") {
-      startQuickLook();
       return;
     }
 
@@ -128,10 +119,6 @@ export function App({
     }
   };
 
-  const startQuickLook = () => {
-    startRuntime();
-  };
-
   const endCameraAR = () => {
     cameraStream?.getTracks().forEach((track) => track.stop());
     setCameraStream(null);
@@ -165,14 +152,6 @@ export function App({
           onEnd={endWebXR}
           onError={handleWebXRError}
         />
-      </Suspense>
-    );
-  }
-
-  if (isActiveRuntimeStatus(sessionStatus) && runtimeKind === "quick-look") {
-    return (
-      <Suspense fallback={<div className="camera-loading">Loading AR...</div>}>
-        <QuickLookSession mascots={mascotManifest} onEnd={endSession} />
       </Suspense>
     );
   }
@@ -223,10 +202,8 @@ export function App({
         {sessionStatus === "readyToStart" ? (
           <ReadyScreen
             onStartAR={startAR}
-            canAttemptWebXR={runtimeKind !== "quick-look" && canAttemptWebXR()}
+            canAttemptWebXR={canAttemptWebXR()}
             onStartWebXR={startWebXR}
-            quickLookMascot={runtimeKind === "quick-look" ? getDefaultQuickLookMascot() : null}
-            onQuickLookFallback={startQuickLook}
           />
         ) : null}
 
@@ -363,37 +340,12 @@ function UnsupportedScreen({
 function ReadyScreen({
   onStartAR,
   canAttemptWebXR,
-  onStartWebXR,
-  quickLookMascot,
-  onQuickLookFallback
+  onStartWebXR
 }: {
   onStartAR: () => void;
   canAttemptWebXR: boolean;
   onStartWebXR: () => void;
-  quickLookMascot: MascotManifestEntry | null;
-  onQuickLookFallback: () => void;
 }) {
-  if (quickLookMascot) {
-    return (
-      <div className="home-ready-screen" data-testid="ready-screen">
-        <a
-          className="primary-action home-start-button home-start-link"
-          href={quickLookMascot.quickLookUrl}
-          rel="ar"
-          onClick={() => scheduleQuickLookFallback(onQuickLookFallback)}
-        >
-          <img
-            className="quick-look-ar-preview"
-            src={quickLookMascot.thumbnailUrl}
-            alt=""
-            draggable="false"
-          />
-          <span>Start Experience</span>
-        </a>
-      </div>
-    );
-  }
-
   return (
     <div className="home-ready-screen" data-testid="ready-screen">
       <button
@@ -407,39 +359,9 @@ function ReadyScreen({
   );
 }
 
-function getDefaultQuickLookMascot() {
-  const mascot = mascotManifest[0];
-
-  if (!mascot) {
-    throw new Error("At least one mascot must be configured.");
-  }
-
-  return mascot;
-}
-
-function scheduleQuickLookFallback(onFallback: () => void) {
-  const handleVisibilityChange = () => {
-    if (document.visibilityState === "hidden") {
-      window.clearTimeout(fallbackTimeout);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    }
-  };
-  const fallbackTimeout = window.setTimeout(() => {
-    document.removeEventListener("visibilitychange", handleVisibilityChange);
-
-    if (document.visibilityState !== "hidden") {
-      onFallback();
-    }
-  }, QUICK_LOOK_FALLBACK_DELAY_MS);
-
-  document.addEventListener("visibilitychange", handleVisibilityChange);
-}
-
 function canAttemptWebXR() {
   return typeof navigator.xr?.requestSession === "function";
 }
-
-const QUICK_LOOK_FALLBACK_DELAY_MS = 1200;
 
 function createCameraError(message: string): UserFacingError {
   return {
