@@ -66,9 +66,7 @@ button {
   gap: 0;
   overflow: hidden;
   padding: clamp(28px, 5vw, 72px);
-  background:
-    radial-gradient(circle at 50% 20%, rgba(29, 78, 216, 0.34), transparent 34%),
-    #020725;
+  background: radial-gradient(circle at 50% 20%, rgba(29, 78, 216, 0.34), transparent 34%), #020725;
 }
 
 .app-header {
@@ -295,6 +293,34 @@ button {
   touch-action: none;
 }
 
+.image-tracking-session {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: #000000;
+}
+
+.image-tracking-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: #000000;
+  touch-action: none;
+}
+
+.image-tracking-viewport canvas,
+.image-tracking-viewport video {
+  position: absolute;
+}
+
+.image-tracking-video {
+  object-fit: cover;
+}
+
+.image-tracking-canvas {
+  pointer-events: none;
+}
+
 .camera-placement-target {
   position: absolute;
   inset: 0;
@@ -424,12 +450,11 @@ button {
   align-items: center;
   padding: 8px 10px;
   color: #f7fbff;
-  background:
-    linear-gradient(
-      90deg,
-      color-mix(in srgb, var(--mascot-accent, #8ee4d1) 18%, transparent),
-      rgba(4, 12, 15, 0.78) 44%
-    );
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--mascot-accent, #8ee4d1) 18%, transparent),
+    rgba(4, 12, 15, 0.78) 44%
+  );
   text-align: left;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.24);
 }
@@ -442,12 +467,11 @@ button {
 .webxr-mascot-choice[data-placed="true"] {
   color: #d5e6e9;
   border-color: color-mix(in srgb, var(--mascot-accent, #ffdf6e) 74%, transparent);
-  background:
-    linear-gradient(
-      90deg,
-      color-mix(in srgb, var(--mascot-accent, #ffdf6e) 24%, transparent),
-      rgba(12, 22, 26, 0.78) 48%
-    );
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--mascot-accent, #ffdf6e) 24%, transparent),
+    rgba(12, 22, 26, 0.78) 48%
+  );
 }
 
 .webxr-mascot-choice:disabled {

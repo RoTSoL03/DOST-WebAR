@@ -92,6 +92,10 @@ export function recommendRuntime(
     return "webxr";
   }
 
+  if (capabilities.osFamily === "ios" && capabilities.cameraApiAvailable) {
+    return "image-tracking";
+  }
+
   if (capabilities.cameraApiAvailable) {
     return "camera-composition";
   }

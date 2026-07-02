@@ -25,6 +25,16 @@ vi.mock("../ar/CameraARSession", () => ({
   )
 }));
 
+vi.mock("../ar/ImageTrackingSession", () => ({
+  ImageTrackingSession: ({ onEnd }: { onEnd: () => void }) => (
+    <div data-testid="image-tracking-session">
+      <button type="button" onClick={onEnd}>
+        End Image Tracking
+      </button>
+    </div>
+  )
+}));
+
 const mobileCameraCapabilities: CapabilityResult = {
   isMobile: true,
   webGL2Available: true,
@@ -36,7 +46,7 @@ const mobileCameraCapabilities: CapabilityResult = {
   nativeShareAvailable: true,
   browserFamily: "safari",
   osFamily: "ios",
-  runtimeRecommendation: "camera-composition"
+  runtimeRecommendation: "image-tracking"
 };
 
 const androidCameraCapabilities: CapabilityResult = {
@@ -130,9 +140,8 @@ describe("App", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("starts the iOS camera composition session from the ready screen", async () => {
-    const stream = { getTracks: vi.fn(() => []) } as unknown as MediaStream;
-    const getUserMedia = vi.fn().mockResolvedValue(stream);
+  it("starts the iOS image tracking session from the ready screen", async () => {
+    const getUserMedia = vi.fn();
     Object.defineProperty(globalThis.navigator, "mediaDevices", {
       configurable: true,
       value: { getUserMedia }
@@ -151,15 +160,8 @@ describe("App", () => {
 
     await user.click(await screen.findByRole("button", { name: "Start Experience" }));
 
-    expect(getUserMedia).toHaveBeenCalledWith({
-      audio: false,
-      video: {
-        facingMode: { ideal: "environment" },
-        width: { ideal: 1280 },
-        height: { ideal: 720 }
-      }
-    });
-    expect(await screen.findByTestId("camera-ar-session")).toBeInTheDocument();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(await screen.findByTestId("image-tracking-session")).toBeInTheDocument();
   });
 
   it("starts WebXR from the ready screen without requesting camera fallback media", async () => {
@@ -264,17 +266,11 @@ describe("App", () => {
   });
 });
 
-async function renderAppWithCapabilities(
-  capabilities: CapabilityResult
-) {
+async function renderAppWithCapabilities(capabilities: CapabilityResult) {
   const deferredCapabilities = createDeferred<CapabilityResult>();
 
   await act(async () => {
-    render(
-      <App
-        detectCapabilitiesFn={() => deferredCapabilities.promise}
-      />
-    );
+    render(<App detectCapabilitiesFn={() => deferredCapabilities.promise} />);
     await Promise.resolve();
   });
 

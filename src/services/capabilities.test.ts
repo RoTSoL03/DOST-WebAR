@@ -36,7 +36,7 @@ describe("detectCapabilities", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("recommends camera composition on iOS when WebXR AR is unavailable", async () => {
+  it("recommends image tracking on iOS when WebXR AR is unavailable", async () => {
     const getUserMedia = vi.fn();
 
     const result = await detectCapabilities({
@@ -51,7 +51,7 @@ describe("detectCapabilities", () => {
       } as unknown as Navigator
     });
 
-    expect(result.runtimeRecommendation).toBe("camera-composition");
+    expect(result.runtimeRecommendation).toBe("image-tracking");
     expect(result.webXRAvailable).toBe(false);
     expect(getUserMedia).not.toHaveBeenCalled();
   });

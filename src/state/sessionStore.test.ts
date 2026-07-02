@@ -13,7 +13,7 @@ const mobileCameraCapabilities: CapabilityResult = {
   nativeShareAvailable: true,
   browserFamily: "safari",
   osFamily: "ios",
-  runtimeRecommendation: "camera-composition"
+  runtimeRecommendation: "image-tracking"
 };
 
 describe("useSessionStore", () => {
@@ -33,7 +33,7 @@ describe("useSessionStore", () => {
     useSessionStore.getState().applyCapabilities(mobileCameraCapabilities);
 
     expect(useSessionStore.getState().sessionStatus).toBe("readyToStart");
-    expect(useSessionStore.getState().runtimeKind).toBe("camera-composition");
+    expect(useSessionStore.getState().runtimeKind).toBe("image-tracking");
     expect(useSessionStore.getState().loading.kind).toBe("idle");
   });
 

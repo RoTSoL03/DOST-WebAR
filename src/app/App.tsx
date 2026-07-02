@@ -9,6 +9,10 @@ const CameraARSession = lazy(() =>
   import("../ar/CameraARSession").then((module) => ({ default: module.CameraARSession }))
 );
 
+const ImageTrackingSession = lazy(() =>
+  import("../ar/ImageTrackingSession").then((module) => ({ default: module.ImageTrackingSession }))
+);
+
 const WebXRSession = lazy(() =>
   import("../ar/WebXRSession").then((module) => ({ default: module.WebXRSession }))
 );
@@ -17,9 +21,7 @@ export interface AppProps {
   detectCapabilitiesFn?: () => Promise<CapabilityResult>;
 }
 
-export function App({
-  detectCapabilitiesFn = detectCapabilities
-}: AppProps) {
+export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
   const sessionStatus = useSessionStore((state) => state.sessionStatus);
   const runtimeKind = useSessionStore((state) => state.runtimeKind);
   const capabilities = useSessionStore((state) => state.capabilities);
@@ -60,7 +62,29 @@ export function App({
       return;
     }
 
+    if (runtimeKind === "image-tracking") {
+      startImageTracking();
+      return;
+    }
+
     await startCameraAR();
+  };
+
+  const startImageTracking = () => {
+    if (!window.isSecureContext) {
+      setError(
+        createImageTrackingError("Image tracking requires HTTPS on phones. Open the HTTPS LAN URL.")
+      );
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setError(createImageTrackingError("This browser does not expose camera access."));
+      return;
+    }
+
+    requestPermission();
+    startRuntime();
   };
 
   const startWebXR = async () => {
@@ -139,10 +163,27 @@ export function App({
     [setError]
   );
 
-  if (
-    isActiveRuntimeStatus(sessionStatus) &&
-    xrSession
-  ) {
+  const handleImageTrackingError = useCallback(
+    (message: string) => {
+      setError(createImageTrackingError(message));
+    },
+    [setError]
+  );
+
+  if (isActiveRuntimeStatus(sessionStatus) && runtimeKind === "image-tracking") {
+    return (
+      <Suspense fallback={<div className="camera-loading">Loading AR...</div>}>
+        <ImageTrackingSession
+          mascots={mascotManifest}
+          imageTargetSrc="/targets/mindar-card.mind"
+          onEnd={endSession}
+          onError={handleImageTrackingError}
+        />
+      </Suspense>
+    );
+  }
+
+  if (isActiveRuntimeStatus(sessionStatus) && xrSession) {
     return (
       <Suspense fallback={<div className="camera-loading">Loading AR...</div>}>
         <WebXRSession
@@ -202,7 +243,7 @@ export function App({
         {sessionStatus === "readyToStart" ? (
           <ReadyScreen
             onStartAR={startAR}
-            canAttemptWebXR={canAttemptWebXR()}
+            canAttemptWebXR={canAttemptWebXR(runtimeKind)}
             onStartWebXR={startWebXR}
           />
         ) : null}
@@ -320,14 +361,10 @@ function LoadingScreen() {
   );
 }
 
-function UnsupportedScreen({
-  osFamily
-}: {
-  osFamily: CapabilityResult["osFamily"];
-}) {
+function UnsupportedScreen({ osFamily }: { osFamily: CapabilityResult["osFamily"] }) {
   const message =
     osFamily === "ios"
-      ? "This prototype is available on Android Chrome"
+      ? "Use iOS Safari on a camera-capable mobile device"
       : "To view and Use AR experience use a mobile device";
 
   return (
@@ -359,8 +396,8 @@ function ReadyScreen({
   );
 }
 
-function canAttemptWebXR() {
-  return typeof navigator.xr?.requestSession === "function";
+function canAttemptWebXR(runtimeKind: ReturnType<typeof useSessionStore.getState>["runtimeKind"]) {
+  return runtimeKind !== "image-tracking" && typeof navigator.xr?.requestSession === "function";
 }
 
 function createCameraError(message: string): UserFacingError {
@@ -376,6 +413,15 @@ function createWebXRError(message: string): UserFacingError {
   return {
     code: "runtime-start-failed",
     title: "WebXR unavailable",
+    message,
+    recoverable: true
+  };
+}
+
+function createImageTrackingError(message: string): UserFacingError {
+  return {
+    code: "runtime-start-failed",
+    title: "Image tracking unavailable",
     message,
     recoverable: true
   };

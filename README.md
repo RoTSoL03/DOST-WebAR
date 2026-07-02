@@ -15,8 +15,8 @@ The product requirements document at `docs/PRD.md` and stakeholder clarification
 
 ## Key MVP Decisions
 
-- Android Chrome WebXR markerless AR for the prototype.
-- iOS is intentionally unsupported for this prototype.
+- Android Chrome WebXR markerless floor scanning for the prototype.
+- iOS Safari MindAR image tracking for the prototype.
 - No Quick Look in MVP.
 - No native app download.
 - No commercial WebAR SDK in MVP.
@@ -53,7 +53,12 @@ Deploy production after the preview is validated:
 vercel --prod
 ```
 
-Testers should open the Vercel HTTPS URL on an ARCore-capable Android phone using Chrome. The WebXR scanner will not run on desktop or iOS for this prototype.
+Testers should open the Vercel HTTPS URL on a mobile device:
+
+- Android: use Chrome on an ARCore-capable phone for WebXR floor scanning.
+- iOS: use Safari and scan the target image at `public/targets/mindar-card.png` for image-tracked mascot placement.
+
+Desktop browsers show the mobile-device fallback screen.
 
 ## Documentation Index
 
