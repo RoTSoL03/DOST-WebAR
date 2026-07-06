@@ -1,9 +1,14 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 
+import { imageTrackingConfig } from "../config/imageTargets";
 import { mascotManifest } from "../config/mascots";
 import { createCapabilityCheckError, type UserFacingError } from "../errors/userFacingError";
 import { detectCapabilities, type CapabilityResult } from "../services/capabilities";
 import { useSessionStore } from "../state/sessionStore";
+
+const ImageTrackingSession = lazy(() =>
+  import("../ar/ImageTrackingSession").then((module) => ({ default: module.ImageTrackingSession }))
+);
 
 const CameraARSession = lazy(() =>
   import("../ar/CameraARSession").then((module) => ({ default: module.CameraARSession }))
@@ -30,6 +35,19 @@ export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
   const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [xrSession, setXrSession] = useState<XRSession | null>(null);
   const [xrOverlayRoot, setXrOverlayRoot] = useState<HTMLElement | null>(null);
+  const [appPage, setAppPage] = useState<AppPage>(() => getInitialAppPage());
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setAppPage(getInitialAppPage());
+    };
+
+    window.addEventListener("popstate", handlePopState);
+
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -141,6 +159,24 @@ export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
     [setError]
   );
 
+  const startImageTracking = () => {
+    window.history.pushState({}, "", IMAGE_TRACKING_PATH);
+    setAppPage("image-tracking");
+  };
+
+  const endImageTracking = useCallback(() => {
+    window.history.pushState({}, "", "/");
+    setAppPage("home");
+  }, []);
+
+  if (appPage === "image-tracking") {
+    return (
+      <Suspense fallback={<div className="camera-loading">Loading Image Tracking...</div>}>
+        <ImageTrackingSession config={imageTrackingConfig} onBack={endImageTracking} />
+      </Suspense>
+    );
+  }
+
   if (isActiveRuntimeStatus(sessionStatus) && xrSession) {
     return (
       <Suspense fallback={<div className="camera-loading">Loading AR...</div>}>
@@ -201,7 +237,8 @@ export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
         {sessionStatus === "readyToStart" ? (
           <ReadyScreen
             onStartAR={startAR}
-            canAttemptWebXR={canAttemptWebXR(runtimeKind)}
+            onStartImageTracking={startImageTracking}
+            canAttemptWebXR={canAttemptWebXR(runtimeKind, capabilities)}
             onStartWebXR={startWebXR}
             quickLookUrl={runtimeKind === "quick-look" ? RESILIENT_FOUR_QUICK_LOOK_URL : null}
           />
@@ -335,11 +372,13 @@ function UnsupportedScreen({ osFamily }: { osFamily: CapabilityResult["osFamily"
 
 function ReadyScreen({
   onStartAR,
+  onStartImageTracking,
   canAttemptWebXR,
   onStartWebXR,
   quickLookUrl
 }: {
   onStartAR: () => void;
+  onStartImageTracking: () => void;
   canAttemptWebXR: boolean;
   onStartWebXR: () => void;
   quickLookUrl: string | null;
@@ -347,38 +386,63 @@ function ReadyScreen({
   if (quickLookUrl) {
     return (
       <div className="home-ready-screen" data-testid="ready-screen">
-        <a
-          className="primary-action home-start-button home-start-link"
-          href={quickLookUrl}
-          rel="ar"
-        >
-          <img
-            className="quick-look-ar-preview"
-            src={QUICK_LOOK_PREVIEW_IMAGE_URL}
-            alt=""
-            draggable="false"
-          />
-          <span>Start Experience</span>
-        </a>
+        <div className="home-action-stack">
+          <a
+            className="primary-action home-start-button home-start-link"
+            href={quickLookUrl}
+            rel="ar"
+          >
+            <img
+              className="quick-look-ar-preview"
+              src={QUICK_LOOK_PREVIEW_IMAGE_URL}
+              alt=""
+              draggable="false"
+            />
+            <span>Start Experience</span>
+          </a>
+          <button
+            className="primary-action home-start-button"
+            type="button"
+            onClick={onStartImageTracking}
+          >
+            Scan Image
+          </button>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="home-ready-screen" data-testid="ready-screen">
-      <button
-        className="primary-action home-start-button"
-        type="button"
-        onClick={canAttemptWebXR ? onStartWebXR : onStartAR}
-      >
-        Start Experience
-      </button>
+      <div className="home-action-stack">
+        <button
+          className="primary-action home-start-button"
+          type="button"
+          onClick={canAttemptWebXR ? onStartWebXR : onStartAR}
+        >
+          Start Experience
+        </button>
+        <button
+          className="primary-action home-start-button"
+          type="button"
+          onClick={onStartImageTracking}
+        >
+          Scan Image
+        </button>
+      </div>
     </div>
   );
 }
 
-function canAttemptWebXR(runtimeKind: ReturnType<typeof useSessionStore.getState>["runtimeKind"]) {
-  return runtimeKind !== "quick-look" && typeof navigator.xr?.requestSession === "function";
+function canAttemptWebXR(
+  runtimeKind: ReturnType<typeof useSessionStore.getState>["runtimeKind"],
+  capabilities: CapabilityResult | null
+) {
+  if (runtimeKind === "webxr") {
+    return true;
+  }
+
+  return capabilities?.osFamily === "android" && typeof navigator.xr?.requestSession === "function";
 }
 
 function createCameraError(message: string): UserFacingError {
@@ -416,3 +480,10 @@ function ErrorScreen() {
 
 const RESILIENT_FOUR_QUICK_LOOK_URL = "/models/resilient_four.usdz";
 const QUICK_LOOK_PREVIEW_IMAGE_URL = "/icons/mascot-alpha.png";
+const IMAGE_TRACKING_PATH = "/ar-image";
+
+type AppPage = "home" | "image-tracking";
+
+function getInitialAppPage(): AppPage {
+  return window.location.pathname === IMAGE_TRACKING_PATH ? "image-tracking" : "home";
+}

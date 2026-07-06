@@ -5,9 +5,21 @@ import globals from "globals";
 import tseslint from "typescript-eslint";
 
 export default tseslint.config(
-  { ignores: ["dist", "coverage"] },
+  { ignores: ["dist", "coverage", "src/vendor"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
+  {
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      globals: {
+        ...globals.node,
+        AbortSignal: "readonly",
+        fetch: "readonly",
+        WebSocket: "readonly"
+      }
+    }
+  },
   {
     files: ["**/*.{ts,tsx}"],
     languageOptions: {

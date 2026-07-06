@@ -25,6 +25,16 @@ vi.mock("../ar/CameraARSession", () => ({
   )
 }));
 
+vi.mock("../ar/ImageTrackingSession", () => ({
+  ImageTrackingSession: ({ onBack }: { onBack: () => void }) => (
+    <div data-testid="image-tracking-session">
+      <button type="button" onClick={onBack}>
+        Back
+      </button>
+    </div>
+  )
+}));
+
 const mobileCameraCapabilities: CapabilityResult = {
   isMobile: true,
   webGL2Available: true,
@@ -36,7 +46,7 @@ const mobileCameraCapabilities: CapabilityResult = {
   nativeShareAvailable: true,
   browserFamily: "safari",
   osFamily: "ios",
-  runtimeRecommendation: "quick-look"
+  runtimeRecommendation: "camera-composition"
 };
 
 const androidCameraCapabilities: CapabilityResult = {
@@ -66,10 +76,12 @@ const desktopUnsupportedCapabilities: CapabilityResult = {
 
 describe("App", () => {
   beforeEach(() => {
+    window.history.pushState({}, "", "/");
     useSessionStore.getState().reset();
   });
 
   afterEach(() => {
+    window.history.pushState({}, "", "/");
     useSessionStore.getState().reset();
   });
 
@@ -91,6 +103,7 @@ describe("App", () => {
 
     expect(await screen.findByTestId("ready-screen")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Start Experience" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Scan Image" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start AR Scanner" })).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Mascot Experience" })).not.toBeInTheDocument();
   });
@@ -126,12 +139,13 @@ describe("App", () => {
 
     await waitFor(() => expect(screen.getByTestId("ready-screen")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "Start Experience" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Scan Image" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start AR Scanner" })).not.toBeInTheDocument();
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
-  it("renders the iOS Quick Look launcher from the ready screen", async () => {
-    const getUserMedia = vi.fn();
+  it("starts the iOS camera-composition session from the ready screen", async () => {
+    const getUserMedia = vi.fn().mockResolvedValue({ getTracks: () => [] });
     Object.defineProperty(globalThis.navigator, "mediaDevices", {
       configurable: true,
       value: { getUserMedia }
@@ -145,14 +159,21 @@ describe("App", () => {
       value: true
     });
 
+    const user = userEvent.setup();
+
     await renderAppWithCapabilities(mobileCameraCapabilities);
 
-    const quickLookLink = await screen.findByRole("link", { name: "Start Experience" });
+    await user.click(await screen.findByRole("button", { name: "Start Experience" }));
 
-    expect(quickLookLink).toHaveAttribute("href", "/models/resilient_four.usdz");
-    expect(quickLookLink).toHaveAttribute("rel", "ar");
-    expect(getUserMedia).not.toHaveBeenCalled();
-    expect(screen.queryByTestId("camera-ar-session")).not.toBeInTheDocument();
+    expect(getUserMedia).toHaveBeenCalledWith({
+      audio: false,
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    });
+    expect(await screen.findByTestId("camera-ar-session")).toBeInTheDocument();
     expect(screen.queryByTestId("webxr-session")).not.toBeInTheDocument();
   });
 
@@ -191,6 +212,39 @@ describe("App", () => {
     );
     expect(getUserMedia).not.toHaveBeenCalled();
     expect(await screen.findByTestId("webxr-session")).toBeInTheDocument();
+  });
+
+  it("opens Image Tracking from the ready screen without starting World Placement", async () => {
+    const getUserMedia = vi.fn();
+    const requestSession = vi.fn();
+    Object.defineProperty(globalThis.navigator, "mediaDevices", {
+      configurable: true,
+      value: { getUserMedia }
+    });
+    Object.defineProperty(globalThis.navigator, "xr", {
+      configurable: true,
+      value: { requestSession }
+    });
+
+    const user = userEvent.setup();
+    await renderAppWithCapabilities(mobileWebXRCapabilities);
+
+    await user.click(await screen.findByRole("button", { name: "Scan Image" }));
+
+    expect(await screen.findByTestId("image-tracking-session")).toBeInTheDocument();
+    expect(screen.queryByTestId("webxr-session")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("camera-ar-session")).not.toBeInTheDocument();
+    expect(requestSession).not.toHaveBeenCalled();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(window.location.pathname).toBe("/ar-image");
+  });
+
+  it("opens Image Tracking directly from the /ar-image route", async () => {
+    window.history.pushState({}, "", "/ar-image");
+
+    await renderAppWithCapabilities(mobileWebXRCapabilities);
+
+    expect(await screen.findByTestId("image-tracking-session")).toBeInTheDocument();
   });
 
   it("allows a direct WebXR scanner attempt when capability detection recommended camera fallback", async () => {

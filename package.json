@@ -11,7 +11,8 @@
     "test:watch": "vitest --config vitest.config.ts",
     "lint": "eslint .",
     "format": "prettier --check .",
-    "build:usdz": "python scripts/build_resilient_four_usdz.py"
+    "build:usdz": "python scripts/build_resilient_four_usdz.py",
+    "compile:targets": "node scripts/compile_mindar_targets.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

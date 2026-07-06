@@ -1,23 +1,38 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AmbientLight,
   AnimationMixer,
-  Box3,
   DirectionalLight,
+  Euler,
   Group,
-  Mesh,
-  Object3D,
-  OrthographicCamera,
+  MathUtils,
+  PerspectiveCamera,
+  Quaternion,
   Scene,
+  Vector2,
   Vector3,
-  WebGLRenderer,
-  type Material
+  WebGLRenderer
 } from "three";
-import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 import type { MascotId, MascotManifestEntry } from "../config/mascots";
+import { instantiateMascotModel } from "../rendering/modelCache";
+import { resolveQualityProfile } from "../services/deviceProfile";
 import { useSessionStore } from "../state/sessionStore";
+import {
+  canvasToBlob,
+  createCaptureFileName,
+  get2DContext,
+  type CapturedPhoto
+} from "./captureUtils";
+import { getScanHint, MascotOverlayControls } from "./MascotOverlayControls";
+import {
+  alignModelBottomToFloor,
+  applyMascotForwardCorrection,
+  createMascotContactShadow,
+  createReticle,
+  disposeObjectResources,
+  MASCOT_TARGET_HEIGHT_METERS
+} from "./mascotSceneUtils";
 
 interface CameraARSessionProps {
   mascots: readonly MascotManifestEntry[];
@@ -25,7 +40,7 @@ interface CameraARSessionProps {
   onEnd: () => void;
 }
 
-type CameraSessionStatus = "loading" | "ready" | "error";
+type CameraSessionStatus = "loading" | "scanning" | "surface-found" | "error";
 type CaptureStatus = "idle" | "capturing" | "ready" | "failed";
 
 interface CameraMascotRuntime {
@@ -37,21 +52,14 @@ interface CameraMascotRuntime {
   placed: boolean;
 }
 
-interface CapturedPhoto {
-  blob: Blob;
-  fileName: string;
-  url: string;
-}
-
-interface WorldPoint {
-  x: number;
-  y: number;
-}
-
-type MascotButtonStyle = CSSProperties & {
-  "--mascot-accent": string;
-};
-
+/**
+ * iOS/fallback AR runtime. Safari does not ship WebXR immersive-ar, so this
+ * session recreates the Android workflow on top of getUserMedia: the camera
+ * feed is the background, the gyroscope orients a virtual perspective camera,
+ * and mascots are placed by raycasting screen taps onto an estimated ground
+ * plane one camera-height below the device. Placement, multi-mascot support
+ * and photo capture behave exactly like the WebXR session.
+ */
 export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -59,12 +67,14 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
   const [activeMascotId, setActiveMascotId] = useState<MascotId>(() => getInitialMascotId(mascots));
   const [loadedMascotIds, setLoadedMascotIds] = useState<MascotId[]>([]);
   const [placedMascotIds, setPlacedMascotIds] = useState<MascotId[]>([]);
+  const [movingMascotId, setMovingMascotId] = useState<MascotId | null>(null);
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("idle");
   const [capturedPhoto, setCapturedPhoto] = useState<CapturedPhoto | null>(null);
   const activeMascotIdRef = useRef<MascotId>(getInitialMascotId(mascots));
   const placedMascotIdsRef = useRef<MascotId[]>([]);
+  const movingMascotIdRef = useRef<MascotId | null>(null);
   const captureStillRef = useRef<() => void>(() => undefined);
-  const removePlacedMascotRef = useRef<(mascotId: MascotId) => void>(() => undefined);
+  const selectMascotForPlacementRef = useRef<(mascotId: MascotId) => void>(() => undefined);
   const enterPlacement = useSessionStore((state) => state.enterPlacement);
   const markMascotPlaced = useSessionStore((state) => state.markMascotPlaced);
 
@@ -75,6 +85,10 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
   useEffect(() => {
     placedMascotIdsRef.current = placedMascotIds;
   }, [placedMascotIds]);
+
+  useEffect(() => {
+    movingMascotIdRef.current = movingMascotId;
+  }, [movingMascotId]);
 
   useEffect(() => {
     return () => {
@@ -119,7 +133,13 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
       return;
     }
 
-    const glContext = createTransparentWebGL2Context(canvas);
+    const profile = resolveQualityProfile();
+    const glContext = canvas.getContext("webgl2", {
+      alpha: true,
+      antialias: profile.antialias,
+      premultipliedAlpha: true,
+      preserveDrawingBuffer: true
+    });
 
     if (!glContext) {
       setStatus("error");
@@ -129,35 +149,48 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
     let disposed = false;
     let captureInProgress = false;
     let previousFrameTime = performance.now();
+    let hasOrientation = false;
+    let lastStatus: CameraSessionStatus = "loading";
     const scene = new Scene();
-    const camera = new OrthographicCamera(-1, 1, 1, -1, 0.1, 20);
+    const camera = new PerspectiveCamera(CAMERA_FOV_DEGREES, 1, 0.05, 60);
     const renderer = new WebGLRenderer({
       canvas,
       context: glContext as unknown as WebGLRenderingContext,
       alpha: true,
-      antialias: true,
+      antialias: profile.antialias,
       preserveDrawingBuffer: true
     });
     const mascotRuntimes = new Map<MascotId, CameraMascotRuntime>();
+    const reticle = createReticle();
+    const orientationQuaternion = new Quaternion();
+    const fixedPitchQuaternion = new Quaternion().setFromEuler(
+      new Euler(FIXED_PITCH_RADIANS, 0, 0, "YXZ")
+    );
+    const aimNdc = new Vector2(0, RETICLE_AIM_NDC_Y);
+    const rayOrigin = new Vector3();
+    const rayDirection = new Vector3();
+    const floorPoint = new Vector3();
 
-    camera.position.set(0, 0, 5);
-    camera.lookAt(0, 0, 0);
+    camera.position.set(0, CAMERA_HEIGHT_METERS, 0);
+    camera.quaternion.copy(fixedPitchQuaternion);
 
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, profile.maxPixelRatio));
     renderer.setClearColor(0x000000, 0);
     renderer.autoClear = true;
 
-    scene.add(new AmbientLight(0xffffff, 1.6));
+    scene.add(new AmbientLight(0xffffff, 1.5));
 
-    const keyLight = new DirectionalLight(0xffffff, 2.2);
-    keyLight.position.set(2, 4, 4);
+    const keyLight = new DirectionalLight(0xffffff, 2);
+    keyLight.position.set(2, 4, 2);
     scene.add(keyLight);
+    scene.add(reticle);
 
     mascots.forEach((manifestEntry) => {
       const root = new Group();
       const model = new Group();
+      const contactShadow = createMascotContactShadow();
       root.visible = false;
-      root.add(model);
+      root.add(contactShadow, model);
       scene.add(root);
       mascotRuntimes.set(manifestEntry.id, {
         mascot: manifestEntry,
@@ -169,17 +202,58 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
       });
     });
 
+    const updateStatus = (nextStatus: CameraSessionStatus) => {
+      if (lastStatus !== nextStatus) {
+        lastStatus = nextStatus;
+        setStatus(nextStatus);
+      }
+    };
+
+    const handleDeviceOrientation = (event: DeviceOrientationEvent) => {
+      if (event.beta === null || event.gamma === null) {
+        return;
+      }
+
+      setQuaternionFromDeviceOrientation(
+        orientationQuaternion,
+        event.alpha ?? 0,
+        event.beta,
+        event.gamma,
+        getScreenOrientationAngle()
+      );
+      hasOrientation = true;
+    };
+
     const resizeRenderer = () => {
       const width = Math.max(1, window.innerWidth);
       const height = Math.max(1, window.innerHeight);
-      const aspect = width / height;
 
-      camera.left = -aspect;
-      camera.right = aspect;
-      camera.top = 1;
-      camera.bottom = -1;
+      camera.aspect = width / height;
       camera.updateProjectionMatrix();
       renderer.setSize(width, height, false);
+    };
+
+    /**
+     * Casts a ray from a normalized screen point onto the estimated ground
+     * plane (y = 0). Returns true when it lands within a placeable range.
+     */
+    const intersectFloor = (ndcX: number, ndcY: number, target: Vector3): boolean => {
+      rayOrigin.setFromMatrixPosition(camera.matrixWorld);
+      rayDirection.set(ndcX, ndcY, 0.5).unproject(camera).sub(rayOrigin).normalize();
+
+      if (rayDirection.y > -MIN_DOWNWARD_RAY_SLOPE) {
+        return false;
+      }
+
+      const distanceAlongRay = -rayOrigin.y / rayDirection.y;
+      target.copy(rayOrigin).addScaledVector(rayDirection, distanceAlongRay);
+
+      const horizontalDistance = Math.hypot(target.x - rayOrigin.x, target.z - rayOrigin.z);
+
+      return (
+        horizontalDistance >= MIN_PLACEMENT_DISTANCE_METERS &&
+        horizontalDistance <= MAX_PLACEMENT_DISTANCE_METERS
+      );
     };
 
     const placeSelectedMascot = (event: PointerEvent) => {
@@ -187,17 +261,37 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
 
       if (
         !runtime ||
-        runtime.placed ||
-        placedMascotIdsRef.current.includes(runtime.mascot.id) ||
         !runtime.loaded
       ) {
         return;
       }
 
+      const rect = canvas.getBoundingClientRect();
+      const ndcX = ((event.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
+      const ndcY = -(((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1);
+
+      if (!intersectFloor(ndcX, ndcY, floorPoint)) {
+        return;
+      }
+
       event.preventDefault();
-      placeMascotAtCameraPoint(runtime.root, getCameraWorldPoint(event, canvas, camera));
+      const wasPlaced = runtime.placed || placedMascotIdsRef.current.includes(runtime.mascot.id);
+      runtime.root.position.copy(floorPoint);
+      runtime.root.rotation.set(
+        0,
+        Math.atan2(camera.position.x - floorPoint.x, camera.position.z - floorPoint.z),
+        0
+      );
       runtime.root.visible = true;
       runtime.placed = true;
+      movingMascotIdRef.current = null;
+      setMovingMascotId(null);
+
+      if (wasPlaced) {
+        updateStatus(placedMascotIdsRef.current.length === mascots.length ? "surface-found" : lastStatus);
+        return;
+      }
+
       markMascotPlaced();
 
       const nextPlacedIds = [...placedMascotIdsRef.current, runtime.mascot.id];
@@ -212,23 +306,13 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
       }
     };
 
-    const removePlacedMascot = (mascotId: MascotId) => {
+    const selectMascotForPlacement = (mascotId: MascotId) => {
       const runtime = mascotRuntimes.get(mascotId);
 
-      if (!runtime?.placed) {
-        activeMascotIdRef.current = mascotId;
-        setActiveMascotId(mascotId);
-        return;
-      }
-
-      runtime.root.visible = false;
-      runtime.placed = false;
-
-      const nextPlacedIds = placedMascotIdsRef.current.filter((id) => id !== mascotId);
-      placedMascotIdsRef.current = nextPlacedIds;
-      setPlacedMascotIds(nextPlacedIds);
       activeMascotIdRef.current = mascotId;
       setActiveMascotId(mascotId);
+      movingMascotIdRef.current = runtime?.placed ? mascotId : null;
+      setMovingMascotId(runtime?.placed ? mascotId : null);
       setCaptureStatus("idle");
       enterPlacement();
     };
@@ -242,6 +326,8 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
 
       captureInProgress = true;
       setCaptureStatus("capturing");
+      const reticleWasVisible = reticle.visible;
+      reticle.visible = false;
       renderer.render(scene, camera);
 
       void captureCameraComposite(video, canvas)
@@ -253,11 +339,7 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
               URL.revokeObjectURL(previousPhoto.url);
             }
 
-            return {
-              blob,
-              fileName,
-              url
-            };
+            return { blob, fileName, url };
           });
           setCaptureStatus("ready");
         })
@@ -265,11 +347,10 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
           setCaptureStatus("failed");
         })
         .finally(() => {
+          reticle.visible = reticleWasVisible;
           captureInProgress = false;
         });
     };
-
-    const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
 
     async function loadMascots() {
       try {
@@ -281,25 +362,20 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
               return;
             }
 
-            const gltf = await loader.loadAsync(manifestEntry.modelUrl);
+            const instance = await instantiateMascotModel(manifestEntry.modelUrl);
 
             if (disposed) {
-              disposeObjectResources(gltf.scene);
               return;
             }
 
-            runtime.model.add(gltf.scene);
-            alignModelBottomToFloor(
-              runtime.model,
-              manifestEntry,
-              CAMERA_MODEL_TARGET_HEIGHT_WORLD
-            );
+            runtime.model.add(instance.scene);
+            alignModelBottomToFloor(runtime.model, manifestEntry, MASCOT_TARGET_HEIGHT_METERS);
             applyMascotForwardCorrection(runtime.model);
 
-            const firstAnimation = gltf.animations[0];
+            const firstAnimation = instance.animations[0];
 
             if (firstAnimation) {
-              runtime.mixer = new AnimationMixer(gltf.scene);
+              runtime.mixer = new AnimationMixer(instance.scene);
               runtime.mixer.clipAction(firstAnimation).play();
             }
 
@@ -312,11 +388,11 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
 
         if (!disposed) {
           enterPlacement();
-          setStatus("ready");
+          updateStatus("scanning");
         }
       } catch {
         if (!disposed) {
-          setStatus("error");
+          updateStatus("error");
         }
       }
     }
@@ -324,9 +400,10 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
     resizeRenderer();
     window.addEventListener("resize", resizeRenderer);
     window.addEventListener("orientationchange", resizeRenderer);
+    window.addEventListener("deviceorientation", handleDeviceOrientation, true);
     canvas.addEventListener("pointerdown", placeSelectedMascot);
     captureStillRef.current = captureStill;
-    removePlacedMascotRef.current = removePlacedMascot;
+    selectMascotForPlacementRef.current = selectMascotForPlacement;
     void loadMascots();
 
     renderer.setAnimationLoop((frameTime) => {
@@ -336,22 +413,63 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
 
       const delta = (frameTime - previousFrameTime) / 1000;
       previousFrameTime = frameTime;
-      mascotRuntimes.forEach((runtime) => runtime.mixer?.update(delta));
+
+      if (hasOrientation) {
+        camera.quaternion.slerp(orientationQuaternion, ORIENTATION_SMOOTHING);
+      }
+
+      camera.updateMatrixWorld();
+
+      let allMascotsPlaced = true;
+      mascotRuntimes.forEach((runtime) => {
+        if (runtime.placed) {
+          runtime.mixer?.update(delta);
+        } else {
+          allMascotsPlaced = false;
+        }
+      });
+
+      if (lastStatus !== "loading" && lastStatus !== "error") {
+        if (allMascotsPlaced && movingMascotIdRef.current === null) {
+          reticle.visible = false;
+        } else if (intersectFloor(aimNdc.x, aimNdc.y, floorPoint)) {
+          reticle.matrix.makeTranslation(floorPoint.x, floorPoint.y, floorPoint.z);
+          reticle.matrixWorldNeedsUpdate = true;
+          reticle.visible = true;
+          updateStatus("surface-found");
+        } else {
+          reticle.visible = false;
+          updateStatus("scanning");
+        }
+      }
+
       renderer.render(scene, camera);
     });
 
     return () => {
       disposed = true;
       captureStillRef.current = () => undefined;
-      removePlacedMascotRef.current = () => undefined;
+      selectMascotForPlacementRef.current = () => undefined;
       canvas.removeEventListener("pointerdown", placeSelectedMascot);
       window.removeEventListener("resize", resizeRenderer);
       window.removeEventListener("orientationchange", resizeRenderer);
+      window.removeEventListener("deviceorientation", handleDeviceOrientation, true);
       renderer.setAnimationLoop(null);
+      mascotRuntimes.forEach((runtime) => {
+        runtime.mixer?.stopAllAction();
+        // Cached model instances share resources with the model cache; detach
+        // them so scene disposal only touches session-owned objects.
+        runtime.model.clear();
+      });
       disposeObjectResources(scene);
       renderer.dispose();
     };
   }, [enterPlacement, markMascotPlaced, mascots]);
+
+  const allPlaced = placedMascotIds.length === mascots.length;
+  const isMovingPlacedMascot = movingMascotId !== null;
+  const activeMascotName =
+    mascots.find((entry) => entry.id === activeMascotId)?.displayName ?? "mascot";
 
   return (
     <section className="camera-ar-session" data-testid="camera-ar-session" data-status={status}>
@@ -366,118 +484,36 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
       <canvas
         ref={canvasRef}
         className="camera-model-layer"
-        aria-label="Tap camera view to place selected mascot"
+        aria-label="Tap the floor to place the selected mascot"
       />
-      <div className="webxr-overlay-controls">
+      <MascotOverlayControls
+        mascots={mascots}
+        activeMascotId={activeMascotId}
+        loadedMascotIds={loadedMascotIds}
+        placedMascotIds={placedMascotIds}
+        onMascotButton={(mascotId) => {
+          selectMascotForPlacementRef.current(mascotId);
+        }}
+        captureButtonLabel={getCaptureButtonLabel(captureStatus)}
+        captureDisabled={
+          Boolean(capturedPhoto) || captureStatus === "capturing" || placedMascotIds.length === 0
+        }
+        onCapture={() => captureStillRef.current()}
+        capturedPhoto={capturedPhoto}
+        onRetake={() => {
+          setCapturedPhoto(null);
+          setCaptureStatus("idle");
+        }}
+      >
         <button className="camera-end-button" type="button" onClick={onEnd}>
           End
         </button>
-        <div className="webxr-mascot-picker" aria-label="Mascots to place">
-          {mascots.map((entry) => {
-            const isLoaded = loadedMascotIds.includes(entry.id);
-            const isPlaced = placedMascotIds.includes(entry.id);
-            const isActive = activeMascotId === entry.id;
-
-            return (
-              <button
-                key={entry.id}
-                className="webxr-mascot-choice"
-                type="button"
-                aria-pressed={isActive}
-                data-placed={isPlaced ? "true" : "false"}
-                style={getMascotButtonStyle(entry.id)}
-                disabled={!isLoaded}
-                onClick={() => {
-                  if (isPlaced) {
-                    removePlacedMascotRef.current(entry.id);
-                    return;
-                  }
-
-                  activeMascotIdRef.current = entry.id;
-                  setActiveMascotId(entry.id);
-                }}
-              >
-                <span className="webxr-mascot-avatar" aria-hidden="true">
-                  <img src={entry.thumbnailUrl} alt="" draggable="false" />
-                </span>
-                <span>{entry.displayName}</span>
-                <small>{getMascotButtonStatus(isLoaded, isPlaced, isActive)}</small>
-              </button>
-            );
-          })}
-        </div>
-        <div className="webxr-capture-row">
-          <button
-            className="webxr-capture-button"
-            type="button"
-            disabled={
-              Boolean(capturedPhoto) ||
-              captureStatus === "capturing" ||
-              placedMascotIds.length === 0
-            }
-            onClick={() => captureStillRef.current()}
-          >
-            {getCaptureButtonLabel(captureStatus)}
-          </button>
-        </div>
-        {capturedPhoto ? (
-          <div className="webxr-capture-preview" role="dialog" aria-label="Captured photo preview">
-            <div className="webxr-capture-preview-frame">
-              <img src={capturedPhoto.url} alt="Captured AR frame preview" />
-            </div>
-            <div className="webxr-capture-actions">
-              <button
-                className="webxr-download-button"
-                type="button"
-                onClick={() => downloadCapturedPhoto(capturedPhoto)}
-              >
-                Download
-              </button>
-              <button
-                className="webxr-retake-button"
-                type="button"
-                onClick={() => {
-                  setCapturedPhoto(null);
-                  setCaptureStatus("idle");
-                }}
-              >
-                Retake
-              </button>
-            </div>
-          </div>
-        ) : null}
-      </div>
+        <p className="camera-scan-hint" role="status">
+          {getScanHint(status, allPlaced && !isMovingPlacedMascot, activeMascotName)}
+        </p>
+      </MascotOverlayControls>
     </section>
   );
-}
-
-function getMascotButtonStatus(isLoaded: boolean, isPlaced: boolean, isActive: boolean) {
-  if (isPlaced) {
-    return "Move";
-  }
-  if (!isLoaded) {
-    return "Loading";
-  }
-  return isActive ? "Tap view" : "Select";
-}
-
-function getMascotButtonStyle(mascotId: MascotId): MascotButtonStyle {
-  return {
-    "--mascot-accent": getMascotAccentColor(mascotId)
-  } as MascotButtonStyle;
-}
-
-function getMascotAccentColor(mascotId: MascotId) {
-  switch (mascotId) {
-    case "mascot-alpha":
-      return "#ff8a1c";
-    case "mascot-amihan":
-      return "#62cfff";
-    case "mascot-ulan":
-      return "#1d4ed8";
-    case "mascot-apoy":
-      return "#ef4444";
-  }
 }
 
 function getCaptureButtonLabel(captureStatus: CaptureStatus) {
@@ -501,15 +537,6 @@ function getInitialMascotId(mascots: readonly MascotManifestEntry[]) {
   }
 
   return mascot.id;
-}
-
-function createTransparentWebGL2Context(canvas: HTMLCanvasElement) {
-  return canvas.getContext("webgl2", {
-    alpha: true,
-    antialias: true,
-    premultipliedAlpha: true,
-    preserveDrawingBuffer: true
-  });
 }
 
 function waitForVideoMetadata(video: HTMLVideoElement) {
@@ -536,27 +563,41 @@ function waitForVideoMetadata(video: HTMLVideoElement) {
   });
 }
 
-function getCameraWorldPoint(
-  event: PointerEvent,
-  canvas: HTMLCanvasElement,
-  camera: OrthographicCamera
-): WorldPoint {
-  const rect = canvas.getBoundingClientRect();
-  const normalizedX = ((event.clientX - rect.left) / Math.max(1, rect.width)) * 2 - 1;
-  const normalizedY = -(((event.clientY - rect.top) / Math.max(1, rect.height)) * 2 - 1);
-  const worldX = normalizedX * Math.max(Math.abs(camera.left), Math.abs(camera.right));
-  const worldY = clamp(normalizedY, CAMERA_PLACEMENT_MIN_Y, CAMERA_PLACEMENT_MAX_Y);
+const orientationEuler = new Euler();
+const orientationScreenQuaternion = new Quaternion();
+const CAMERA_LOOK_ADJUSTMENT = new Quaternion(-Math.sqrt(0.5), 0, 0, Math.sqrt(0.5));
+const Z_AXIS = new Vector3(0, 0, 1);
 
-  return {
-    x: worldX,
-    y: worldY
-  };
+/**
+ * Standard deviceorientation → camera quaternion conversion (the math used by
+ * three.js DeviceOrientationControls), including screen-rotation compensation.
+ */
+function setQuaternionFromDeviceOrientation(
+  target: Quaternion,
+  alphaDeg: number,
+  betaDeg: number,
+  gammaDeg: number,
+  screenOrientationDeg: number
+) {
+  const alpha = MathUtils.degToRad(alphaDeg);
+  const beta = MathUtils.degToRad(betaDeg);
+  const gamma = MathUtils.degToRad(gammaDeg);
+  const orient = MathUtils.degToRad(screenOrientationDeg);
+
+  orientationEuler.set(beta, alpha, -gamma, "YXZ");
+  target.setFromEuler(orientationEuler);
+  target.multiply(CAMERA_LOOK_ADJUSTMENT);
+  target.multiply(orientationScreenQuaternion.setFromAxisAngle(Z_AXIS, -orient));
 }
 
-function placeMascotAtCameraPoint(mascotRoot: Group, point: WorldPoint) {
-  mascotRoot.position.set(point.x, point.y, 0);
-  mascotRoot.rotation.set(0, 0, 0);
-  mascotRoot.updateMatrixWorld(true);
+function getScreenOrientationAngle(): number {
+  if (typeof screen !== "undefined" && screen.orientation) {
+    return screen.orientation.angle;
+  }
+
+  const legacyOrientation = (window as { orientation?: number }).orientation;
+
+  return typeof legacyOrientation === "number" ? legacyOrientation : 0;
 }
 
 async function captureCameraComposite(video: HTMLVideoElement, overlayCanvas: HTMLCanvasElement) {
@@ -606,87 +647,14 @@ function drawCoveredVideoFrame(
   );
 }
 
-function get2DContext(canvas: HTMLCanvasElement) {
-  const context = canvas.getContext("2d");
-
-  if (!context) {
-    throw new Error("2D canvas is unavailable.");
-  }
-
-  return context;
-}
-
-function canvasToBlob(canvas: HTMLCanvasElement) {
-  return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) {
-        resolve(blob);
-        return;
-      }
-
-      reject(new Error("Canvas capture failed."));
-    }, "image/png");
-  });
-}
-
-function downloadCapturedPhoto(photo: CapturedPhoto) {
-  const link = document.createElement("a");
-  link.href = photo.url;
-  link.download = photo.fileName;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-}
-
-function createCaptureFileName() {
-  return `dost-webar-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
-}
-
-function alignModelBottomToFloor(root: Group, mascot: MascotManifestEntry, targetHeight: number) {
-  root.position.set(0, 0, 0);
-  root.scale.setScalar(1);
-  root.updateMatrixWorld(true);
-
-  const bounds = new Box3().setFromObject(root);
-  const size = bounds.getSize(new Vector3());
-  const center = bounds.getCenter(new Vector3());
-  const largestAxis = Math.max(size.x, size.y, size.z, 1);
-  const normalizedScale = (targetHeight / largestAxis) * mascot.defaultScale;
-
-  root.scale.setScalar(normalizedScale);
-  root.position.set(
-    -center.x * normalizedScale,
-    -bounds.min.y * normalizedScale + mascot.defaultVerticalOffset,
-    -center.z * normalizedScale
-  );
-}
-
-function applyMascotForwardCorrection(root: Group) {
-  root.rotation.y = MASCOT_FORWARD_YAW_OFFSET;
-}
-
-function disposeObjectResources(object: Object3D) {
-  object.traverse((child: Object3D) => {
-    const mesh = child as Mesh;
-    mesh.geometry?.dispose();
-
-    if (Array.isArray(mesh.material)) {
-      mesh.material.forEach(disposeMaterial);
-    } else if (mesh.material) {
-      disposeMaterial(mesh.material);
-    }
-  });
-}
-
-function disposeMaterial(material: Material) {
-  material.dispose();
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
-}
-
-const CAMERA_MODEL_TARGET_HEIGHT_WORLD = 0.62;
-const CAMERA_PLACEMENT_MIN_Y = -0.92;
-const CAMERA_PLACEMENT_MAX_Y = 0.62;
-const MASCOT_FORWARD_YAW_OFFSET = -Math.PI / 2;
+const CAMERA_FOV_DEGREES = 62;
+/** Assumed height of a hand-held phone above the floor. */
+const CAMERA_HEIGHT_METERS = 1.4;
+/** Camera pitch used when gyroscope data is unavailable or denied. */
+const FIXED_PITCH_RADIANS = -0.42;
+/** Aim point for the reticle, slightly below screen center. */
+const RETICLE_AIM_NDC_Y = -0.3;
+const MIN_DOWNWARD_RAY_SLOPE = 0.08;
+const MIN_PLACEMENT_DISTANCE_METERS = 0.4;
+const MAX_PLACEMENT_DISTANCE_METERS = 7;
+const ORIENTATION_SMOOTHING = 0.3;

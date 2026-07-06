@@ -1,11 +1,9 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   AmbientLight,
   AnimationMixer,
-  Box3,
   BufferGeometry,
-  CircleGeometry,
   DirectionalLight,
   DoubleSide,
   Float32BufferAttribute,
@@ -17,18 +15,31 @@ import {
   Object3D,
   PerspectiveCamera,
   PlaneGeometry,
-  RingGeometry,
   Scene,
   Vector3,
   WebGLRenderer,
-  type Camera,
-  type Material
+  type Camera
 } from "three";
-import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 import type { MascotId, MascotManifestEntry } from "../config/mascots";
+import { instantiateMascotModel } from "../rendering/modelCache";
+import { resolveQualityProfile, type QualityProfile } from "../services/deviceProfile";
 import { useSessionStore } from "../state/sessionStore";
+import {
+  canvasToBlob,
+  createCaptureFileName,
+  get2DContext,
+  type CapturedPhoto
+} from "./captureUtils";
+import { getScanHint, MascotOverlayControls, type ScanStatus } from "./MascotOverlayControls";
+import {
+  alignModelBottomToFloor,
+  applyMascotForwardCorrection,
+  createMascotContactShadow,
+  createReticle,
+  disposeObjectResources,
+  MASCOT_TARGET_HEIGHT_METERS
+} from "./mascotSceneUtils";
 
 interface WebXRSessionProps {
   mascots: readonly MascotManifestEntry[];
@@ -38,7 +49,6 @@ interface WebXRSessionProps {
   onError: (message: string) => void;
 }
 
-type WebXRStatus = "loading" | "scanning" | "surface-found" | "placed" | "error";
 type PlacementReferenceSpaceType = "local-floor" | "local";
 type CaptureStatus = "idle" | "capturing" | "ready" | "failed";
 type CameraCaptureState = "checking" | "available" | "unavailable";
@@ -51,28 +61,6 @@ type CaptureFailureReason =
   | "Camera image was blank"
   | "Capture image encoding failed";
 
-interface ScannerStats {
-  xrSessionStarted: boolean;
-  referenceSpaceType: PlacementReferenceSpaceType | "pending";
-  hitTestSourceReady: boolean;
-  frameCount: number;
-  hitFrameCount: number;
-  patchCount: number;
-  loadedCount: number;
-  placedCount: number;
-}
-
-const initialScannerStats: ScannerStats = {
-  xrSessionStarted: false,
-  referenceSpaceType: "pending",
-  hitTestSourceReady: false,
-  frameCount: 0,
-  hitFrameCount: 0,
-  patchCount: 0,
-  loadedCount: 0,
-  placedCount: 0
-};
-
 interface MascotRuntime {
   mascot: MascotManifestEntry;
   root: Group;
@@ -80,12 +68,6 @@ interface MascotRuntime {
   mixer: AnimationMixer | null;
   loaded: boolean;
   placed: boolean;
-}
-
-interface CapturedPhoto {
-  blob: Blob;
-  fileName: string;
-  url: string;
 }
 
 interface CaptureFrameOptions {
@@ -96,6 +78,7 @@ interface CaptureFrameOptions {
   frame?: XRFrame;
   referenceSpace: XRReferenceSpace | null;
   xrWebGLBinding: XRWebGLBindingCameraAccess | null;
+  acquireVirtualRenderer: (width: number, height: number) => WebGLRenderer | null;
 }
 
 interface CaptureResult {
@@ -113,10 +96,6 @@ interface ReadableFrameImage {
   height: number;
 }
 
-type MascotButtonStyle = CSSProperties & {
-  "--mascot-accent": string;
-};
-
 export function WebXRSession({
   mascots,
   domOverlayRoot,
@@ -125,12 +104,11 @@ export function WebXRSession({
   onError
 }: WebXRSessionProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [, setStatus] = useState<WebXRStatus>("loading");
-  const [, setReticleAvailable] = useState(false);
-  const [scannerStats, setScannerStats] = useState<ScannerStats>(initialScannerStats);
+  const [status, setStatus] = useState<ScanStatus>("loading");
   const [activeMascotId, setActiveMascotId] = useState<MascotId>(() => getInitialMascotId(mascots));
   const [loadedMascotIds, setLoadedMascotIds] = useState<MascotId[]>([]);
   const [placedMascotIds, setPlacedMascotIds] = useState<MascotId[]>([]);
+  const [movingMascotId, setMovingMascotId] = useState<MascotId | null>(null);
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus>("idle");
   const [cameraCaptureState, setCameraCaptureState] = useState<CameraCaptureState>("checking");
   const [captureFailureReason, setCaptureFailureReason] = useState<CaptureFailureReason | null>(
@@ -139,8 +117,9 @@ export function WebXRSession({
   const [capturedPhoto, setCapturedPhoto] = useState<CapturedPhoto | null>(null);
   const activeMascotIdRef = useRef<MascotId>(getInitialMascotId(mascots));
   const placedMascotIdsRef = useRef<MascotId[]>([]);
+  const movingMascotIdRef = useRef<MascotId | null>(null);
   const captureStillRef = useRef<() => void>(() => undefined);
-  const removePlacedMascotRef = useRef<(mascotId: MascotId) => void>(() => undefined);
+  const selectMascotForPlacementRef = useRef<(mascotId: MascotId) => void>(() => undefined);
   const enterPlacement = useSessionStore((state) => state.enterPlacement);
   const markMascotPlaced = useSessionStore((state) => state.markMascotPlaced);
 
@@ -151,6 +130,10 @@ export function WebXRSession({
   useEffect(() => {
     placedMascotIdsRef.current = placedMascotIds;
   }, [placedMascotIds]);
+
+  useEffect(() => {
+    movingMascotIdRef.current = movingMascotId;
+  }, [movingMascotId]);
 
   useEffect(() => {
     return () => {
@@ -188,20 +171,17 @@ export function WebXRSession({
     }
 
     const xrCanvas = canvas;
+    const profile = resolveQualityProfile();
     let disposed = false;
     let sessionEnded = false;
     let renderer: WebGLRenderer | null = null;
+    let captureRenderer: WebGLRenderer | null = null;
     let hitTestSource: XRHitTestSource | null = null;
     let placementReferenceSpace: XRReferenceSpace | null = null;
-    let lastReticleAvailable = false;
-    let lastSurfaceStatus: "scanning" | "surface-found" = "scanning";
+    let lastSurfaceStatus: ScanStatus = "loading";
     let lastSurfaceSampleTime = 0;
-    let lastStatsUpdateTime = 0;
     let previousFrameTime = performance.now();
-    let frameCount = 0;
-    let hitFrameCount = 0;
     let referenceSpaceType: PlacementReferenceSpaceType = "local";
-    let loadedCount = 0;
     let placedCount = 0;
     let captureRequested = false;
     let captureInProgress = false;
@@ -218,14 +198,68 @@ export function WebXRSession({
     const camera = new PerspectiveCamera();
     const mascotRuntimes = new Map<MascotId, MascotRuntime>();
     const reticle = createReticle();
-    const surfacePreview = createSurfacePatch(0.28, 0.85);
+    // All surface patches share the same geometry; only materials (opacity)
+    // are per-patch. Expired patches return to a pool instead of being
+    // recreated, so steady-state scanning allocates nothing per frame.
+    const patchGeometries = {
+      fill: new PlaneGeometry(SURFACE_PATCH_SIZE_METERS, SURFACE_PATCH_SIZE_METERS).rotateX(
+        -Math.PI / 2
+      ),
+      grid: createSurfaceGridGeometry(SURFACE_PATCH_SIZE_METERS, SURFACE_PATCH_DIVISIONS)
+    };
+    const surfacePatchPool: Group[] = [];
+    const surfacePreview = createSurfacePatch(patchGeometries, 0.28, 0.85);
     const scannedSurfaces = new Group();
+
+    const acquireScannedPatch = () =>
+      surfacePatchPool.pop() ?? createSurfacePatch(patchGeometries, 0.14, 0.52);
+
+    const releaseScannedPatch = (patch: Group) => {
+      scannedSurfaces.remove(patch);
+
+      if (surfacePatchPool.length < profile.maxScannedSurfacePatches) {
+        surfacePatchPool.push(patch);
+      } else {
+        disposeSurfacePatchMaterials(patch);
+      }
+    };
+
+    const acquireVirtualRenderer = (width: number, height: number): WebGLRenderer | null => {
+      if (!captureRenderer) {
+        const captureCanvas = document.createElement("canvas");
+        const captureContext = captureCanvas.getContext("webgl2", {
+          alpha: true,
+          antialias: profile.antialias,
+          premultipliedAlpha: true,
+          preserveDrawingBuffer: true
+        });
+
+        if (!captureContext) {
+          return null;
+        }
+
+        captureRenderer = new WebGLRenderer({
+          canvas: captureCanvas,
+          context: captureContext as unknown as WebGLRenderingContext,
+          alpha: true,
+          antialias: profile.antialias,
+          preserveDrawingBuffer: true
+        });
+        captureRenderer.xr.enabled = false;
+        captureRenderer.setPixelRatio(1);
+        captureRenderer.setClearColor(0x000000, 0);
+      }
+
+      captureRenderer.setSize(width, height, false);
+
+      return captureRenderer;
+    };
 
     async function startWebXR() {
       let startupStep = "creating renderer";
 
       try {
-        const glContext = createXRCompatibleWebGL2Context(xrCanvas);
+        const glContext = createXRCompatibleWebGL2Context(xrCanvas, profile);
 
         if (!glContext) {
           throw new Error("WebGL context creation failed.");
@@ -235,11 +269,10 @@ export function WebXRSession({
           canvas: xrCanvas,
           context: glContext as unknown as WebGLRenderingContext,
           alpha: true,
-          antialias: true,
-          preserveDrawingBuffer: true
+          antialias: profile.antialias
         });
         renderer.xr.enabled = true;
-        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, profile.maxPixelRatio));
         renderer.setSize(window.innerWidth, window.innerHeight, false);
 
         scene.add(new AmbientLight(0xffffff, 1.5));
@@ -272,7 +305,6 @@ export function WebXRSession({
         scene.add(reticle);
 
         startupStep = "loading mascot models";
-        const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
 
         await Promise.all(
           mascots.map(async (manifestEntry) => {
@@ -282,26 +314,24 @@ export function WebXRSession({
               return;
             }
 
-            const gltf = await loader.loadAsync(manifestEntry.modelUrl);
+            const instance = await instantiateMascotModel(manifestEntry.modelUrl);
 
             if (disposed) {
-              disposeObjectResources(gltf.scene);
               return;
             }
 
-            runtime.model.add(gltf.scene);
-            alignModelBottomToFloor(runtime.model, manifestEntry, WEBXR_MODEL_TARGET_HEIGHT_METERS);
+            runtime.model.add(instance.scene);
+            alignModelBottomToFloor(runtime.model, manifestEntry, MASCOT_TARGET_HEIGHT_METERS);
             applyMascotForwardCorrection(runtime.model);
 
-            const firstAnimation = gltf.animations[0];
+            const firstAnimation = instance.animations[0];
 
             if (firstAnimation) {
-              runtime.mixer = new AnimationMixer(gltf.scene);
+              runtime.mixer = new AnimationMixer(instance.scene);
               runtime.mixer.clipAction(firstAnimation).play();
             }
 
             runtime.loaded = true;
-            loadedCount += 1;
             setLoadedMascotIds((ids) =>
               ids.includes(manifestEntry.id) ? ids : [...ids, manifestEntry.id]
             );
@@ -311,6 +341,7 @@ export function WebXRSession({
         startupStep = "requesting reference space";
         referenceSpaceType = await requestPlacementReferenceSpaceType(session);
         renderer.xr.setReferenceSpaceType(referenceSpaceType);
+        renderer.xr.setFramebufferScaleFactor(profile.xrFramebufferScale);
 
         startupStep = "binding WebXR session";
         await renderer.xr.setSession(session);
@@ -345,26 +376,11 @@ export function WebXRSession({
 
         enterPlacement();
         startupStep = "running scanner";
-        setStatus("scanning");
         lastSurfaceStatus = "scanning";
-        setScannerStats({
-          xrSessionStarted: true,
-          referenceSpaceType,
-          hitTestSourceReady: true,
-          frameCount,
-          hitFrameCount,
-          patchCount: scannedSurfaces.children.length,
-          loadedCount,
-          placedCount
-        });
+        setStatus("scanning");
 
         const updateSurfaceState = (surfaceFound: boolean) => {
-          if (lastReticleAvailable !== surfaceFound) {
-            lastReticleAvailable = surfaceFound;
-            setReticleAvailable(surfaceFound);
-          }
-
-          const nextStatus = surfaceFound ? "surface-found" : "scanning";
+          const nextStatus: ScanStatus = surfaceFound ? "surface-found" : "scanning";
 
           if (lastSurfaceStatus !== nextStatus) {
             lastSurfaceStatus = nextStatus;
@@ -383,30 +399,16 @@ export function WebXRSession({
           setCaptureStatus("capturing");
         };
 
-        removePlacedMascotRef.current = (mascotId) => {
+        selectMascotForPlacementRef.current = (mascotId) => {
           const runtime = mascotRuntimes.get(mascotId);
 
-          if (!runtime?.placed) {
-            activeMascotIdRef.current = mascotId;
-            setActiveMascotId(mascotId);
-            return;
-          }
-
-          runtime.root.visible = false;
-          runtime.placed = false;
-          placedCount = Math.max(0, placedCount - 1);
-
-          const nextPlacedIds = placedMascotIdsRef.current.filter((id) => id !== mascotId);
-          placedMascotIdsRef.current = nextPlacedIds;
-          setPlacedMascotIds(nextPlacedIds);
           activeMascotIdRef.current = mascotId;
           setActiveMascotId(mascotId);
-          setStatus(reticle.visible ? "surface-found" : "scanning");
+          movingMascotIdRef.current = runtime?.placed ? mascotId : null;
+          setMovingMascotId(runtime?.placed ? mascotId : null);
+          lastSurfaceStatus = reticle.visible ? "surface-found" : "scanning";
+          setStatus(lastSurfaceStatus);
           enterPlacement();
-          setScannerStats((stats) => ({
-            ...stats,
-            placedCount
-          }));
         };
 
         renderer.setAnimationLoop((frameTime, frame) => {
@@ -416,17 +418,23 @@ export function WebXRSession({
 
           const delta = (frameTime - previousFrameTime) / 1000;
           previousFrameTime = frameTime;
-          mascotRuntimes.forEach((runtime) => runtime.mixer?.update(delta));
-          fadeScannedSurfacePatches(scannedSurfaces, frameTime);
-          frameCount += 1;
+          // Only animate mascots that are actually visible in the scene.
+          mascotRuntimes.forEach((runtime) => {
+            if (runtime.placed) {
+              runtime.mixer?.update(delta);
+            }
+          });
+          fadeScannedSurfacePatches(scannedSurfaces, frameTime, releaseScannedPatch);
 
-          if (frame && hitTestSource && placementReferenceSpace && placedCount < mascots.length) {
+          const needsPlacementSurface =
+            placedCount < mascots.length || movingMascotIdRef.current !== null;
+
+          if (frame && hitTestSource && placementReferenceSpace && needsPlacementSurface) {
             const hitTestResults = frame.getHitTestResults(hitTestSource);
             const hit = hitTestResults[0];
             const pose = hit?.getPose(placementReferenceSpace);
 
             if (pose) {
-              hitFrameCount += 1;
               latestHitMatrix.set(pose.transform.matrix);
               reticle.visible = true;
               reticle.matrix.fromArray(pose.transform.matrix);
@@ -446,7 +454,10 @@ export function WebXRSession({
                   frameTime,
                   surfaceSamplePosition,
                   lastSurfaceSamplePosition,
-                  lastSurfaceSampleTime
+                  lastSurfaceSampleTime,
+                  profile,
+                  acquireScannedPatch,
+                  releaseScannedPatch
                 )
               ) {
                 lastSurfaceSampleTime = frameTime;
@@ -485,20 +496,6 @@ export function WebXRSession({
             }
           }
 
-          if (frameTime - lastStatsUpdateTime > SCANNER_STATS_INTERVAL_MS) {
-            lastStatsUpdateTime = frameTime;
-            setScannerStats({
-              xrSessionStarted: true,
-              referenceSpaceType,
-              hitTestSourceReady: Boolean(hitTestSource),
-              frameCount,
-              hitFrameCount,
-              patchCount: scannedSurfaces.children.length,
-              loadedCount,
-              placedCount
-            });
-          }
-
           if (captureRequested && !captureInProgress) {
             captureRequested = false;
 
@@ -518,7 +515,8 @@ export function WebXRSession({
               hiddenObjects: [reticle, surfacePreview, scannedSurfaces],
               frame,
               referenceSpace: placementReferenceSpace,
-              xrWebGLBinding
+              xrWebGLBinding,
+              acquireVirtualRenderer
             })
               .then((result) => {
                 const fileName = createCaptureFileName();
@@ -576,22 +574,32 @@ export function WebXRSession({
       const selectedMascotId = activeMascotIdRef.current;
       const runtime = mascotRuntimes.get(selectedMascotId);
 
-      if (
-        !runtime ||
-        runtime.placed ||
-        placedMascotIdsRef.current.includes(selectedMascotId) ||
-        !runtime.loaded ||
-        !reticle.visible
-      ) {
+      if (!runtime || !runtime.loaded || !reticle.visible) {
         return;
       }
 
+      const wasPlaced = runtime.placed || placedMascotIdsRef.current.includes(selectedMascotId);
       placeMascotAtHit(runtime.root, latestHitMatrix);
       runtime.root.visible = true;
       runtime.placed = true;
+      movingMascotIdRef.current = null;
+      setMovingMascotId(null);
+
+      if (wasPlaced) {
+        if (placedCount === mascots.length) {
+          reticle.visible = false;
+          surfacePreview.visible = false;
+          lastSurfaceStatus = "placed";
+        } else {
+          lastSurfaceStatus = "surface-found";
+        }
+
+        setStatus(lastSurfaceStatus);
+        return;
+      }
+
       placedCount += 1;
       markMascotPlaced();
-      setReticleAvailable(false);
 
       const nextPlacedIds = [...placedMascotIdsRef.current, selectedMascotId];
       placedMascotIdsRef.current = nextPlacedIds;
@@ -602,17 +610,14 @@ export function WebXRSession({
       if (nextMascot) {
         activeMascotIdRef.current = nextMascot.id;
         setActiveMascotId(nextMascot.id);
-        setStatus(reticle.visible ? "surface-found" : "scanning");
+        lastSurfaceStatus = reticle.visible ? "surface-found" : "scanning";
+        setStatus(lastSurfaceStatus);
       } else {
         reticle.visible = false;
         surfacePreview.visible = false;
+        lastSurfaceStatus = "placed";
         setStatus("placed");
       }
-
-      setScannerStats((stats) => ({
-        ...stats,
-        placedCount
-      }));
     };
 
     const handleEnd = () => {
@@ -628,12 +633,23 @@ export function WebXRSession({
 
       disposed = true;
       captureStillRef.current = () => undefined;
-      removePlacedMascotRef.current = () => undefined;
+      selectMascotForPlacementRef.current = () => undefined;
       session.removeEventListener("select", handleSelect);
       session.removeEventListener("end", handleEnd);
       renderer?.setAnimationLoop(null);
       hitTestSource?.cancel();
+      mascotRuntimes.forEach((runtime) => {
+        runtime.mixer?.stopAllAction();
+        // Cached model instances share geometry/materials with the model
+        // cache; detach them so scene disposal only frees session resources.
+        runtime.model.clear();
+      });
+      surfacePatchPool.forEach(disposeSurfacePatchMaterials);
+      surfacePatchPool.length = 0;
       disposeObjectResources(scene);
+      patchGeometries.fill.dispose();
+      patchGeometries.grid.dispose();
+      captureRenderer?.dispose();
       renderer?.dispose();
     }
 
@@ -650,94 +666,45 @@ export function WebXRSession({
     };
   }, [enterPlacement, markMascotPlaced, mascots, onEnd, onError, session]);
 
+  const allPlaced = placedMascotIds.length === mascots.length;
+  const isMovingPlacedMascot = movingMascotId !== null;
+  const activeMascotName =
+    mascots.find((entry) => entry.id === activeMascotId)?.displayName ?? "mascot";
+  const captureWarnings = [
+    ...(cameraCaptureState === "unavailable"
+      ? ["Browser camera capture is unavailable in this WebXR session."]
+      : []),
+    ...(captureStatus === "failed" && captureFailureReason ? [captureFailureReason] : [])
+  ];
+
   const overlayControls = (
-    <div className="webxr-overlay-controls">
-      <div className="webxr-mascot-picker" aria-label="Mascots to place">
-        {mascots.map((entry) => {
-          const isLoaded = loadedMascotIds.includes(entry.id);
-          const isPlaced = placedMascotIds.includes(entry.id);
-          const isActive = activeMascotId === entry.id;
-
-          return (
-            <button
-              key={entry.id}
-              className="webxr-mascot-choice"
-              type="button"
-              aria-pressed={isActive}
-              data-placed={isPlaced ? "true" : "false"}
-              style={getMascotButtonStyle(entry.id)}
-              disabled={!isLoaded}
-              onClick={() => {
-                if (isPlaced) {
-                  removePlacedMascotRef.current(entry.id);
-                  return;
-                }
-
-                activeMascotIdRef.current = entry.id;
-                setActiveMascotId(entry.id);
-              }}
-            >
-              <span className="webxr-mascot-avatar" aria-hidden="true">
-                <img src={entry.thumbnailUrl} alt="" draggable="false" />
-              </span>
-              <span>{entry.displayName}</span>
-              <small>{getMascotButtonStatus(isLoaded, isPlaced, isActive)}</small>
-            </button>
-          );
-        })}
-      </div>
-      <div className="webxr-capture-row">
-        <button
-          className="webxr-capture-button"
-          type="button"
-          disabled={
-            Boolean(capturedPhoto) ||
-            captureStatus === "capturing" ||
-            cameraCaptureState !== "available" ||
-            scannerStats.placedCount === 0
-          }
-          onClick={() => captureStillRef.current()}
-        >
-          {getCaptureButtonLabel(captureStatus, cameraCaptureState)}
-        </button>
-        {cameraCaptureState === "unavailable" ? (
-          <p className="webxr-capture-warning" role="status">
-            Browser camera capture is unavailable in this WebXR session.
-          </p>
-        ) : null}
-        {captureStatus === "failed" && captureFailureReason ? (
-          <p className="webxr-capture-warning" role="status">
-            {captureFailureReason}
-          </p>
-        ) : null}
-      </div>
-      {capturedPhoto ? (
-        <div className="webxr-capture-preview" role="dialog" aria-label="Captured photo preview">
-          <div className="webxr-capture-preview-frame">
-            <img src={capturedPhoto.url} alt="Captured AR frame preview" />
-          </div>
-          <div className="webxr-capture-actions">
-            <button
-              className="webxr-download-button"
-              type="button"
-              onClick={() => downloadCapturedPhoto(capturedPhoto)}
-            >
-              Download
-            </button>
-            <button
-              className="webxr-retake-button"
-              type="button"
-              onClick={() => {
-                setCapturedPhoto(null);
-                setCaptureStatus("idle");
-              }}
-            >
-              Retake
-            </button>
-          </div>
-        </div>
-      ) : null}
-    </div>
+    <MascotOverlayControls
+      mascots={mascots}
+      activeMascotId={activeMascotId}
+      loadedMascotIds={loadedMascotIds}
+      placedMascotIds={placedMascotIds}
+      onMascotButton={(mascotId) => {
+        selectMascotForPlacementRef.current(mascotId);
+      }}
+      captureButtonLabel={getCaptureButtonLabel(captureStatus, cameraCaptureState)}
+      captureDisabled={
+        Boolean(capturedPhoto) ||
+        captureStatus === "capturing" ||
+        cameraCaptureState !== "available" ||
+        placedMascotIds.length === 0
+      }
+      onCapture={() => captureStillRef.current()}
+      captureWarnings={captureWarnings}
+      capturedPhoto={capturedPhoto}
+      onRetake={() => {
+        setCapturedPhoto(null);
+        setCaptureStatus("idle");
+      }}
+    >
+      <p className="camera-scan-hint" role="status">
+        {getScanHint(status, allPlaced && !isMovingPlacedMascot, activeMascotName)}
+      </p>
+    </MascotOverlayControls>
   );
 
   return (
@@ -746,35 +713,6 @@ export function WebXRSession({
       {domOverlayRoot ? createPortal(overlayControls, domOverlayRoot) : overlayControls}
     </section>
   );
-}
-
-function getMascotButtonStatus(isLoaded: boolean, isPlaced: boolean, isActive: boolean) {
-  if (isPlaced) {
-    return "Move";
-  }
-  if (!isLoaded) {
-    return "Loading";
-  }
-  return isActive ? "Tap floor" : "Select";
-}
-
-function getMascotButtonStyle(mascotId: MascotId): MascotButtonStyle {
-  return {
-    "--mascot-accent": getMascotAccentColor(mascotId)
-  } as MascotButtonStyle;
-}
-
-function getMascotAccentColor(mascotId: MascotId) {
-  switch (mascotId) {
-    case "mascot-alpha":
-      return "#ff8a1c";
-    case "mascot-amihan":
-      return "#62cfff";
-    case "mascot-ulan":
-      return "#1d4ed8";
-    case "mascot-apoy":
-      return "#ef4444";
-  }
 }
 
 function getCaptureButtonLabel(
@@ -809,41 +747,24 @@ function getInitialMascotId(mascots: readonly MascotManifestEntry[]) {
   return mascot.id;
 }
 
-function createReticle() {
-  const reticle = new Group();
-  const platformGeometry = new CircleGeometry(0.38, 64).rotateX(-Math.PI / 2);
-  const platformMaterial = new MeshBasicMaterial({
-    color: 0x8ee4d1,
-    side: DoubleSide,
-    transparent: true,
-    opacity: 0.34,
-    depthTest: false,
-    depthWrite: false
-  });
-  const platform = new Mesh(platformGeometry, platformMaterial);
-  const geometry = new RingGeometry(0.12, 0.16, 32).rotateX(-Math.PI / 2);
-  const material = new MeshBasicMaterial({
-    color: 0xffdf6e,
-    side: DoubleSide,
-    transparent: true,
-    opacity: 1,
-    depthTest: false,
-    depthWrite: false
-  });
-  const ring = new Mesh(geometry, material);
-  reticle.add(platform, ring);
-  reticle.matrixAutoUpdate = false;
-  reticle.visible = false;
-
-  return reticle;
+interface SurfacePatchGeometries {
+  fill: PlaneGeometry;
+  grid: BufferGeometry;
 }
 
-function createSurfacePatch(fillOpacity: number, lineOpacity: number) {
+interface SurfacePatchMaterials {
+  fill: MeshBasicMaterial;
+  line: LineBasicMaterial;
+  fillOpacity: number;
+  lineOpacity: number;
+}
+
+function createSurfacePatch(
+  geometries: SurfacePatchGeometries,
+  fillOpacity: number,
+  lineOpacity: number
+) {
   const patch = new Group();
-  const fillGeometry = new PlaneGeometry(
-    SURFACE_PATCH_SIZE_METERS,
-    SURFACE_PATCH_SIZE_METERS
-  ).rotateX(-Math.PI / 2);
   const fillMaterial = new MeshBasicMaterial({
     color: 0x35f3cf,
     side: DoubleSide,
@@ -852,41 +773,37 @@ function createSurfacePatch(fillOpacity: number, lineOpacity: number) {
     depthTest: false,
     depthWrite: false
   });
-  const fill = new Mesh(fillGeometry, fillMaterial);
-  const grid = new LineSegments(
-    createSurfaceGridGeometry(SURFACE_PATCH_SIZE_METERS, SURFACE_PATCH_DIVISIONS),
-    new LineBasicMaterial({
-      color: 0xf9f871,
-      transparent: true,
-      opacity: lineOpacity,
-      depthTest: false,
-      depthWrite: false
-    })
-  );
+  const lineMaterial = new LineBasicMaterial({
+    color: 0xf9f871,
+    transparent: true,
+    opacity: lineOpacity,
+    depthTest: false,
+    depthWrite: false
+  });
+  const fill = new Mesh(geometries.fill, fillMaterial);
+  const grid = new LineSegments(geometries.grid, lineMaterial);
   grid.position.y = 0.004;
   patch.add(fill, grid);
   patch.matrixAutoUpdate = false;
-  patch.userData.fillOpacity = fillOpacity;
-  patch.userData.lineOpacity = lineOpacity;
+  const patchMaterials: SurfacePatchMaterials = {
+    fill: fillMaterial,
+    line: lineMaterial,
+    fillOpacity,
+    lineOpacity
+  };
+  patch.userData.materials = patchMaterials;
 
   return patch;
 }
 
-function createMascotContactShadow() {
-  const geometry = new CircleGeometry(1, 64).rotateX(-Math.PI / 2);
-  const material = new MeshBasicMaterial({
-    color: 0x000000,
-    transparent: true,
-    opacity: 0.28,
-    depthWrite: false
-  });
-  const shadow = new Mesh(geometry, material);
+function getSurfacePatchMaterials(patch: Object3D): SurfacePatchMaterials | null {
+  return (patch.userData.materials as SurfacePatchMaterials | undefined) ?? null;
+}
 
-  shadow.position.y = 0.006;
-  shadow.scale.set(WEBXR_SHADOW_RADIUS_X_METERS, 1, WEBXR_SHADOW_RADIUS_Z_METERS);
-  shadow.renderOrder = -1;
-
-  return shadow;
+function disposeSurfacePatchMaterials(patch: Group) {
+  const materials = getSurfacePatchMaterials(patch);
+  materials?.fill.dispose();
+  materials?.line.dispose();
 }
 
 function sampleScannedSurfacePatch(
@@ -895,32 +812,36 @@ function sampleScannedSurfacePatch(
   frameTime: number,
   samplePosition: Vector3,
   lastSamplePosition: Vector3,
-  lastSampleTime: number
+  lastSampleTime: number,
+  profile: QualityProfile,
+  acquirePatch: () => Group,
+  releasePatch: (patch: Group) => void
 ): boolean {
   samplePosition.set(matrix[12] ?? 0, matrix[13] ?? 0, matrix[14] ?? 0);
 
   if (
-    frameTime - lastSampleTime < SURFACE_SAMPLE_INTERVAL_MS ||
+    frameTime - lastSampleTime < profile.surfaceSampleIntervalMs ||
     samplePosition.distanceTo(lastSamplePosition) < SURFACE_SAMPLE_DISTANCE_METERS
   ) {
     return false;
   }
 
-  const patch = createSurfacePatch(0.14, 0.52);
+  const patch = acquirePatch();
   patch.matrix.fromArray(matrix);
   patch.userData.createdAt = frameTime;
+  patch.visible = true;
+  setSurfacePatchOpacity(patch, 1);
   markObjectMatrixDirty(patch);
   scannedSurfaces.add(patch);
   lastSamplePosition.copy(samplePosition);
 
-  while (scannedSurfaces.children.length > MAX_SCANNED_SURFACE_PATCHES) {
+  while (scannedSurfaces.children.length > profile.maxScannedSurfacePatches) {
     const oldestPatch = scannedSurfaces.children[0];
     if (!oldestPatch) {
       break;
     }
 
-    scannedSurfaces.remove(oldestPatch);
-    disposeObjectResources(oldestPatch);
+    releasePatch(oldestPatch as Group);
   }
 
   return true;
@@ -932,20 +853,23 @@ function updateSurfacePatchFade(patch: Group, ageMs: number) {
   patch.visible = opacityScale > 0;
 }
 
-function fadeScannedSurfacePatches(scannedSurfaces: Group, frameTime: number) {
-  [...scannedSurfaces.children].forEach((patch) => {
+function fadeScannedSurfacePatches(
+  scannedSurfaces: Group,
+  frameTime: number,
+  releasePatch: (patch: Group) => void
+) {
+  for (let index = scannedSurfaces.children.length - 1; index >= 0; index -= 1) {
+    const patch = scannedSurfaces.children[index] as Group;
     const createdAt = typeof patch.userData.createdAt === "number" ? patch.userData.createdAt : 0;
-    const ageMs = frameTime - createdAt;
-    const opacityScale = getSurfacePatternOpacityScale(ageMs);
+    const opacityScale = getSurfacePatternOpacityScale(frameTime - createdAt);
 
     if (opacityScale <= 0) {
-      scannedSurfaces.remove(patch);
-      disposeObjectResources(patch);
-      return;
+      releasePatch(patch);
+      continue;
     }
 
     setSurfacePatchOpacity(patch, opacityScale);
-  });
+  }
 }
 
 function getSurfacePatternOpacityScale(ageMs: number) {
@@ -958,25 +882,16 @@ function getSurfacePatternOpacityScale(ageMs: number) {
 }
 
 function setSurfacePatchOpacity(patch: Object3D, opacityScale: number) {
-  const fillOpacity =
-    typeof patch.userData.fillOpacity === "number" ? patch.userData.fillOpacity : 0.14;
-  const lineOpacity =
-    typeof patch.userData.lineOpacity === "number" ? patch.userData.lineOpacity : 0.52;
-  let materialIndex = 0;
+  const materials = getSurfacePatchMaterials(patch);
 
-  patch.traverse((child) => {
-    const mesh = child as Mesh | LineSegments;
-    const material = mesh.material;
+  if (!materials) {
+    return;
+  }
 
-    if (!material || Array.isArray(material)) {
-      return;
-    }
-
-    material.opacity = (materialIndex === 0 ? fillOpacity : lineOpacity) * opacityScale;
-    material.transparent = true;
-    material.needsUpdate = true;
-    materialIndex += 1;
-  });
+  // Opacity is a uniform update; never set material.needsUpdate here — that
+  // forces shader program rebuilds and causes frame spikes on slow GPUs.
+  materials.fill.opacity = materials.fillOpacity * opacityScale;
+  materials.line.opacity = materials.lineOpacity * opacityScale;
 }
 
 async function captureCleanFrame({
@@ -986,7 +901,8 @@ async function captureCleanFrame({
   hiddenObjects,
   frame,
   referenceSpace,
-  xrWebGLBinding
+  xrWebGLBinding,
+  acquireVirtualRenderer
 }: CaptureFrameOptions): Promise<CaptureResult> {
   const previousVisibility = hiddenObjects.map((object) => object.visible);
 
@@ -1010,6 +926,7 @@ async function captureCleanFrame({
     }
 
     const virtualImage = renderVirtualSceneImage(
+      acquireVirtualRenderer,
       scene,
       getCurrentXRCaptureCamera(renderer, camera),
       cameraImage.width,
@@ -1026,12 +943,14 @@ async function captureCleanFrame({
   }
 }
 
-function createXRCompatibleWebGL2Context(canvas: HTMLCanvasElement) {
+function createXRCompatibleWebGL2Context(canvas: HTMLCanvasElement, profile: QualityProfile) {
   const attributes: WebGLContextAttributes & { xrCompatible: boolean } = {
     alpha: true,
-    antialias: true,
+    antialias: profile.antialias,
     premultipliedAlpha: true,
-    preserveDrawingBuffer: true,
+    // The XR framebuffer is captured through camera-access + an offscreen
+    // renderer, so the main canvas never needs preserveDrawingBuffer.
+    preserveDrawingBuffer: false,
     xrCompatible: true
   };
 
@@ -1046,43 +965,22 @@ function getCurrentXRCaptureCamera(renderer: WebGLRenderer, fallbackCamera: Came
 }
 
 function renderVirtualSceneImage(
+  acquireVirtualRenderer: (width: number, height: number) => WebGLRenderer | null,
   scene: Scene,
   camera: Camera,
   width: number,
   height: number
 ): ReadableFrameImage | null {
-  const canvas = document.createElement("canvas");
-  const glContext = canvas.getContext("webgl2", {
-    alpha: true,
-    antialias: true,
-    premultipliedAlpha: true,
-    preserveDrawingBuffer: true
-  });
+  const virtualRenderer = acquireVirtualRenderer(width, height);
 
-  if (!glContext) {
+  if (!virtualRenderer) {
     return null;
   }
 
-  const virtualRenderer = new WebGLRenderer({
-    canvas,
-    context: glContext as unknown as WebGLRenderingContext,
-    alpha: true,
-    antialias: true,
-    preserveDrawingBuffer: true
-  });
+  virtualRenderer.clear(true, true, true);
+  virtualRenderer.render(scene, camera);
 
-  try {
-    virtualRenderer.xr.enabled = false;
-    virtualRenderer.setPixelRatio(1);
-    virtualRenderer.setSize(width, height, false);
-    virtualRenderer.setClearColor(0x000000, 0);
-    virtualRenderer.clear(true, true, true);
-    virtualRenderer.render(scene, camera);
-
-    return readCurrentFramebufferImage(virtualRenderer.getContext(), canvas);
-  } finally {
-    virtualRenderer.dispose();
-  }
+  return readCurrentFramebufferImage(virtualRenderer.getContext(), virtualRenderer.domElement);
 }
 
 function hasRawCameraView(frame: XRFrame, referenceSpace: XRReferenceSpace) {
@@ -1295,16 +1193,6 @@ async function composeCaptureBlob(
   return canvasToBlob(canvas);
 }
 
-function get2DContext(canvas: HTMLCanvasElement) {
-  const context = canvas.getContext("2d");
-
-  if (!context) {
-    throw new Error("2D canvas is unavailable.");
-  }
-
-  return context;
-}
-
 function createCaptureError(reason: CaptureFailureReason) {
   const error = new Error(reason);
   error.name = "CaptureFailure";
@@ -1328,58 +1216,9 @@ function shouldRetryCapture(reason: CaptureFailureReason, attemptCount: number) 
   return attemptCount < CAPTURE_RETRY_FRAME_LIMIT && reason !== "Capture image encoding failed";
 }
 
-function canvasToBlob(canvas: HTMLCanvasElement) {
-  return new Promise<Blob>((resolve, reject) => {
-    canvas.toBlob((blob) => {
-      if (blob) {
-        resolve(blob);
-        return;
-      }
-
-      reject(new Error("Canvas capture failed."));
-    }, "image/png");
-  });
-}
-
-function downloadCapturedPhoto(photo: CapturedPhoto) {
-  const link = document.createElement("a");
-  link.href = photo.url;
-  link.download = photo.fileName;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-}
-
-function createCaptureFileName() {
-  return `dost-webar-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
-}
-
 function placeMascotAtHit(mascotRoot: Group, hitMatrix: Float32Array) {
   mascotRoot.matrix.fromArray(hitMatrix);
   markObjectMatrixDirty(mascotRoot);
-}
-
-function alignModelBottomToFloor(root: Group, mascot: MascotManifestEntry, targetHeight: number) {
-  root.position.set(0, 0, 0);
-  root.scale.setScalar(1);
-  root.updateMatrixWorld(true);
-
-  const bounds = new Box3().setFromObject(root);
-  const size = bounds.getSize(new Vector3());
-  const center = bounds.getCenter(new Vector3());
-  const largestAxis = Math.max(size.x, size.y, size.z, 1);
-  const normalizedScale = (targetHeight / largestAxis) * mascot.defaultScale;
-
-  root.scale.setScalar(normalizedScale);
-  root.position.set(
-    -center.x * normalizedScale,
-    -bounds.min.y * normalizedScale + mascot.defaultVerticalOffset,
-    -center.z * normalizedScale
-  );
-}
-
-function applyMascotForwardCorrection(root: Group) {
-  root.rotation.y = MASCOT_FORWARD_YAW_OFFSET;
 }
 
 function markObjectMatrixDirty(object: Object3D) {
@@ -1407,19 +1246,12 @@ function createSurfaceGridGeometry(size: number, divisions: number) {
 
 const SURFACE_PATCH_SIZE_METERS = 1.2;
 const SURFACE_PATCH_DIVISIONS = 6;
-const SURFACE_SAMPLE_INTERVAL_MS = 220;
 const SURFACE_SAMPLE_DISTANCE_METERS = 0.28;
-const MAX_SCANNED_SURFACE_PATCHES = 16;
 const SURFACE_PATTERN_HOLD_MS = 1000;
 const SURFACE_PATTERN_FADE_MS = 500;
-const SCANNER_STATS_INTERVAL_MS = 450;
 const CAMERA_READBACK_PROBE_FRAME_LIMIT = 90;
 const CAMERA_READY_FRAME_THRESHOLD = 4;
 const CAPTURE_RETRY_FRAME_LIMIT = 45;
-const WEBXR_MODEL_TARGET_HEIGHT_METERS = 1.4;
-const WEBXR_SHADOW_RADIUS_X_METERS = 0.38;
-const WEBXR_SHADOW_RADIUS_Z_METERS = 0.24;
-const MASCOT_FORWARD_YAW_OFFSET = -Math.PI / 2;
 const CAPTURE_FAILURE_REASONS: readonly CaptureFailureReason[] = [
   "Camera view missing",
   "Camera texture unavailable",
@@ -1448,21 +1280,4 @@ function canUseWebGL() {
     (typeof window.WebGLRenderingContext !== "undefined" ||
       typeof window.WebGL2RenderingContext !== "undefined")
   );
-}
-
-function disposeObjectResources(object: Object3D) {
-  object.traverse((child: Object3D) => {
-    const mesh = child as Mesh;
-    mesh.geometry?.dispose();
-
-    if (Array.isArray(mesh.material)) {
-      mesh.material.forEach(disposeMaterial);
-    } else if (mesh.material) {
-      disposeMaterial(mesh.material);
-    }
-  });
-}
-
-function disposeMaterial(material: Material) {
-  material.dispose();
 }
