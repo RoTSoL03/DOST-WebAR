@@ -2,11 +2,20 @@ import { useEffect, useRef, useState } from "react";
 import {
   AmbientLight,
   AnimationMixer,
+  BufferGeometry,
   DirectionalLight,
+  DoubleSide,
   Euler,
+  Float32BufferAttribute,
   Group,
+  LineBasicMaterial,
+  LineSegments,
   MathUtils,
+  Mesh,
+  MeshBasicMaterial,
+  Object3D,
   PerspectiveCamera,
+  PlaneGeometry,
   Quaternion,
   Scene,
   Vector2,
@@ -25,6 +34,14 @@ import {
   type CapturedPhoto
 } from "./captureUtils";
 import { getScanHint, MascotOverlayControls } from "./MascotOverlayControls";
+import {
+  createMascotVfx,
+  disposeMascotVfx,
+  startMascotAppear,
+  startMascotDisappear,
+  updateMascotVfx,
+  type MascotVfx
+} from "./mascotVfx";
 import {
   alignModelBottomToFloor,
   applyMascotForwardCorrection,
@@ -46,10 +63,16 @@ type CaptureStatus = "idle" | "capturing" | "ready" | "failed";
 interface CameraMascotRuntime {
   mascot: MascotManifestEntry;
   root: Group;
+  contentRoot: Group;
   model: Group;
+  vfx: MascotVfx;
   mixer: AnimationMixer | null;
   loaded: boolean;
   placed: boolean;
+  visible: boolean;
+  modelVisible: boolean;
+  appearStartedAt: number | null;
+  disappearStartedAt: number | null;
 }
 
 /**
@@ -150,6 +173,9 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
     let captureInProgress = false;
     let previousFrameTime = performance.now();
     let hasOrientation = false;
+    let floorReady = false;
+    let floorConfidenceMs = 0;
+    let lastSurfacePatchTime = 0;
     let lastStatus: CameraSessionStatus = "loading";
     const scene = new Scene();
     const camera = new PerspectiveCamera(CAMERA_FOV_DEGREES, 1, 0.05, 60);
@@ -163,6 +189,12 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
     const mascotRuntimes = new Map<MascotId, CameraMascotRuntime>();
     const reticle = createReticle();
     const orientationQuaternion = new Quaternion();
+    const pendingOrientationQuaternion = new Quaternion();
+    const lastAcceptedOrientationQuaternion = new Quaternion();
+    const estimatedCameraPosition = new Vector3(0, CAMERA_HEIGHT_METERS, 0);
+    const estimatedCameraVelocity = new Vector3();
+    const motionAcceleration = new Vector3();
+    const worldMotionAcceleration = new Vector3();
     const fixedPitchQuaternion = new Quaternion().setFromEuler(
       new Euler(FIXED_PITCH_RADIANS, 0, 0, "YXZ")
     );
@@ -170,9 +202,19 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
     const rayOrigin = new Vector3();
     const rayDirection = new Vector3();
     const floorPoint = new Vector3();
+    const lastSurfacePatchPosition = new Vector3(Number.POSITIVE_INFINITY, 0, 0);
+    const surfacePatchGeometries = createSurfacePatchGeometries();
+    const scannedSurfaces = new Group();
+    const needsOrientation = needsSpatialSensorPermission();
+    let hasMotionPosition = false;
+    let lastMotionTime: number | null = null;
+    let lastMotionEventTime = 0;
 
     camera.position.set(0, CAMERA_HEIGHT_METERS, 0);
     camera.quaternion.copy(fixedPitchQuaternion);
+    orientationQuaternion.copy(fixedPitchQuaternion);
+    pendingOrientationQuaternion.copy(fixedPitchQuaternion);
+    lastAcceptedOrientationQuaternion.copy(fixedPitchQuaternion);
 
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, profile.maxPixelRatio));
     renderer.setClearColor(0x000000, 0);
@@ -183,22 +225,33 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
     const keyLight = new DirectionalLight(0xffffff, 2);
     keyLight.position.set(2, 4, 2);
     scene.add(keyLight);
+    scene.add(scannedSurfaces);
     scene.add(reticle);
 
     mascots.forEach((manifestEntry) => {
       const root = new Group();
+      const contentRoot = new Group();
       const model = new Group();
+      const vfx = createMascotVfx();
       const contactShadow = createMascotContactShadow();
+      root.matrixAutoUpdate = false;
       root.visible = false;
-      root.add(contactShadow, model);
+      contentRoot.add(contactShadow, model);
+      root.add(contentRoot, vfx.group);
       scene.add(root);
       mascotRuntimes.set(manifestEntry.id, {
         mascot: manifestEntry,
         root,
+        contentRoot,
         model,
+        vfx,
         mixer: null,
         loaded: false,
-        placed: false
+        placed: false,
+        visible: false,
+        modelVisible: false,
+        appearStartedAt: null,
+        disappearStartedAt: null
       });
     });
 
@@ -215,13 +268,80 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
       }
 
       setQuaternionFromDeviceOrientation(
-        orientationQuaternion,
+        pendingOrientationQuaternion,
         event.alpha ?? 0,
         event.beta,
         event.gamma,
         getScreenOrientationAngle()
       );
+
+      if (
+        quaternionAngleBetween(
+          pendingOrientationQuaternion,
+          lastAcceptedOrientationQuaternion
+        ) < ORIENTATION_INPUT_DEADBAND_RADIANS
+      ) {
+        return;
+      }
+
+      orientationQuaternion.copy(pendingOrientationQuaternion);
+      lastAcceptedOrientationQuaternion.copy(pendingOrientationQuaternion);
       hasOrientation = true;
+    };
+
+    const handleDeviceMotion = (event: DeviceMotionEvent) => {
+      const acceleration = event.acceleration;
+
+      if (
+        acceleration?.x === null ||
+        acceleration?.y === null ||
+        acceleration?.z === null ||
+        acceleration?.x === undefined ||
+        acceleration?.y === undefined ||
+        acceleration?.z === undefined
+      ) {
+        return;
+      }
+
+      const now = performance.now();
+      const deltaSeconds =
+        lastMotionTime === null
+          ? 0
+          : Math.min((now - lastMotionTime) / 1000, MOTION_MAX_DELTA_SECONDS);
+      lastMotionTime = now;
+      lastMotionEventTime = now;
+
+      if (deltaSeconds <= 0) {
+        return;
+      }
+
+      motionAcceleration.set(acceleration.x, acceleration.y, acceleration.z);
+      worldMotionAcceleration.copy(motionAcceleration).applyQuaternion(camera.quaternion);
+      worldMotionAcceleration.y = 0;
+
+      const accelerationLength = worldMotionAcceleration.length();
+
+      if (accelerationLength < MOTION_ACCELERATION_DEADBAND) {
+        estimatedCameraVelocity.multiplyScalar(
+          Math.exp(-MOTION_VELOCITY_DAMPING_PER_SECOND * deltaSeconds)
+        );
+        return;
+      }
+
+      worldMotionAcceleration.multiplyScalar(
+        ((Math.min(accelerationLength, MOTION_MAX_ACCELERATION) -
+          MOTION_ACCELERATION_DEADBAND) /
+          accelerationLength) *
+          MOTION_ACCELERATION_GAIN
+      );
+
+      estimatedCameraVelocity.addScaledVector(worldMotionAcceleration, deltaSeconds);
+      estimatedCameraVelocity.multiplyScalar(
+        Math.exp(-MOTION_VELOCITY_DAMPING_PER_SECOND * deltaSeconds)
+      );
+      estimatedCameraPosition.addScaledVector(estimatedCameraVelocity, deltaSeconds);
+      clampHorizontalCameraEstimate(estimatedCameraPosition);
+      hasMotionPosition = true;
     };
 
     const resizeRenderer = () => {
@@ -259,10 +379,7 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
     const placeSelectedMascot = (event: PointerEvent) => {
       const runtime = mascotRuntimes.get(activeMascotIdRef.current);
 
-      if (
-        !runtime ||
-        !runtime.loaded
-      ) {
+      if (!runtime || !runtime.loaded || !floorReady) {
         return;
       }
 
@@ -276,14 +393,9 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
 
       event.preventDefault();
       const wasPlaced = runtime.placed || placedMascotIdsRef.current.includes(runtime.mascot.id);
-      runtime.root.position.copy(floorPoint);
-      runtime.root.rotation.set(
-        0,
-        Math.atan2(camera.position.x - floorPoint.x, camera.position.z - floorPoint.z),
-        0
-      );
-      runtime.root.visible = true;
+      applyStableMascotAnchor(runtime.root, floorPoint);
       runtime.placed = true;
+      startMascotAppear(runtime, performance.now());
       movingMascotIdRef.current = null;
       setMovingMascotId(null);
 
@@ -313,6 +425,16 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
       setActiveMascotId(mascotId);
       movingMascotIdRef.current = runtime?.placed ? mascotId : null;
       setMovingMascotId(runtime?.placed ? mascotId : null);
+
+      if (runtime?.placed) {
+        runtime.placed = false;
+        runtime.visible = false;
+        startMascotDisappear(runtime, performance.now());
+      }
+
+      floorReady = false;
+      floorConfidenceMs = 0;
+      reticle.visible = false;
       setCaptureStatus("idle");
       enterPlacement();
     };
@@ -401,6 +523,7 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
     window.addEventListener("resize", resizeRenderer);
     window.addEventListener("orientationchange", resizeRenderer);
     window.addEventListener("deviceorientation", handleDeviceOrientation, true);
+    window.addEventListener("devicemotion", handleDeviceMotion, true);
     canvas.addEventListener("pointerdown", placeSelectedMascot);
     captureStillRef.current = captureStill;
     selectMascotForPlacementRef.current = selectMascotForPlacement;
@@ -415,29 +538,76 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
       previousFrameTime = frameTime;
 
       if (hasOrientation) {
-        camera.quaternion.slerp(orientationQuaternion, ORIENTATION_SMOOTHING);
+        camera.quaternion.slerp(orientationQuaternion, getDampingAlpha(delta));
+      }
+
+      if (hasMotionPosition) {
+        if (frameTime - lastMotionEventTime > MOTION_STALE_MS) {
+          estimatedCameraVelocity.multiplyScalar(
+            Math.exp(-MOTION_IDLE_DAMPING_PER_SECOND * Math.min(delta, MAX_FRAME_DELTA))
+          );
+        }
+
+        camera.position.lerp(estimatedCameraPosition, getPositionDampingAlpha(delta));
       }
 
       camera.updateMatrixWorld();
 
       let allMascotsPlaced = true;
       mascotRuntimes.forEach((runtime) => {
-        if (runtime.placed) {
-          runtime.mixer?.update(delta);
-        } else {
+        const hasActiveVfx = updateMascotVfx(runtime, frameTime);
+
+        if (!runtime.placed) {
           allMascotsPlaced = false;
         }
+
+        if (runtime.placed || hasActiveVfx) {
+          runtime.mixer?.update(delta);
+        }
+
+        if (!runtime.placed && !hasActiveVfx && runtime.disappearStartedAt === null) {
+          runtime.root.visible = false;
+        }
       });
+      fadeScannedSurfacePatches(scannedSurfaces, frameTime);
 
       if (lastStatus !== "loading" && lastStatus !== "error") {
         if (allMascotsPlaced && movingMascotIdRef.current === null) {
           reticle.visible = false;
         } else if (intersectFloor(aimNdc.x, aimNdc.y, floorPoint)) {
-          reticle.matrix.makeTranslation(floorPoint.x, floorPoint.y, floorPoint.z);
-          reticle.matrixWorldNeedsUpdate = true;
-          reticle.visible = true;
-          updateStatus("surface-found");
+          if (hasOrientation || !needsOrientation) {
+            floorConfidenceMs = Math.min(
+              FLOOR_SCAN_CONFIRMATION_MS,
+              floorConfidenceMs + delta * 1000
+            );
+
+            if (
+              sampleScannedSurfacePatch(
+                scannedSurfaces,
+                surfacePatchGeometries,
+                floorPoint,
+                frameTime,
+                lastSurfacePatchPosition,
+                lastSurfacePatchTime
+              )
+            ) {
+              lastSurfacePatchTime = frameTime;
+            }
+
+            floorReady = floorConfidenceMs >= FLOOR_SCAN_CONFIRMATION_MS;
+            reticle.matrix.makeTranslation(floorPoint.x, floorPoint.y, floorPoint.z);
+            reticle.matrixWorldNeedsUpdate = true;
+            reticle.visible = floorReady;
+            updateStatus(floorReady ? "surface-found" : "scanning");
+          } else {
+            floorReady = false;
+            floorConfidenceMs = 0;
+            reticle.visible = false;
+            updateStatus("scanning");
+          }
         } else {
+          floorReady = false;
+          floorConfidenceMs = Math.max(0, floorConfidenceMs - delta * 1000 * 2);
           reticle.visible = false;
           updateStatus("scanning");
         }
@@ -454,12 +624,16 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
       window.removeEventListener("resize", resizeRenderer);
       window.removeEventListener("orientationchange", resizeRenderer);
       window.removeEventListener("deviceorientation", handleDeviceOrientation, true);
+      window.removeEventListener("devicemotion", handleDeviceMotion, true);
       renderer.setAnimationLoop(null);
+      surfacePatchGeometries.fill.dispose();
+      surfacePatchGeometries.grid.dispose();
       mascotRuntimes.forEach((runtime) => {
         runtime.mixer?.stopAllAction();
         // Cached model instances share resources with the model cache; detach
         // them so scene disposal only touches session-owned objects.
         runtime.model.clear();
+        disposeMascotVfx(runtime.vfx);
       });
       disposeObjectResources(scene);
       renderer.dispose();
@@ -590,6 +764,40 @@ function setQuaternionFromDeviceOrientation(
   target.multiply(orientationScreenQuaternion.setFromAxisAngle(Z_AXIS, -orient));
 }
 
+function quaternionAngleBetween(first: Quaternion, second: Quaternion) {
+  return first.angleTo(second);
+}
+
+function getDampingAlpha(deltaSeconds: number) {
+  return 1 - Math.exp(-ORIENTATION_DAMPING_PER_SECOND * Math.min(deltaSeconds, MAX_FRAME_DELTA));
+}
+
+function getPositionDampingAlpha(deltaSeconds: number) {
+  return 1 - Math.exp(-POSITION_DAMPING_PER_SECOND * Math.min(deltaSeconds, MAX_FRAME_DELTA));
+}
+
+function clampHorizontalCameraEstimate(position: Vector3) {
+  position.y = CAMERA_HEIGHT_METERS;
+
+  const horizontalDistance = Math.hypot(position.x, position.z);
+
+  if (horizontalDistance <= MAX_ESTIMATED_CAMERA_TRANSLATION_METERS) {
+    return;
+  }
+
+  const scale = MAX_ESTIMATED_CAMERA_TRANSLATION_METERS / horizontalDistance;
+  position.x *= scale;
+  position.z *= scale;
+}
+
+function applyStableMascotAnchor(root: Group, floorPosition: Vector3) {
+  root.position.copy(floorPosition);
+  root.rotation.set(0, Math.atan2(-floorPosition.x, -floorPosition.z), 0);
+  root.updateMatrix();
+  root.updateMatrixWorld(true);
+  root.visible = true;
+}
+
 function getScreenOrientationAngle(): number {
   if (typeof screen !== "undefined" && screen.orientation) {
     return screen.orientation.angle;
@@ -647,6 +855,165 @@ function drawCoveredVideoFrame(
   );
 }
 
+interface SurfacePatchGeometries {
+  fill: PlaneGeometry;
+  grid: BufferGeometry;
+}
+
+function createSurfacePatchGeometries(): SurfacePatchGeometries {
+  return {
+    fill: new PlaneGeometry(CAMERA_SURFACE_PATCH_SIZE_METERS, CAMERA_SURFACE_PATCH_SIZE_METERS)
+      .rotateX(-Math.PI / 2),
+    grid: createSurfaceGridGeometry(
+      CAMERA_SURFACE_PATCH_SIZE_METERS,
+      CAMERA_SURFACE_PATCH_DIVISIONS
+    )
+  };
+}
+
+function sampleScannedSurfacePatch(
+  scannedSurfaces: Group,
+  geometries: SurfacePatchGeometries,
+  position: Vector3,
+  frameTime: number,
+  lastPatchPosition: Vector3,
+  lastPatchTime: number
+) {
+  if (
+    frameTime - lastPatchTime < CAMERA_SURFACE_SAMPLE_INTERVAL_MS ||
+    position.distanceTo(lastPatchPosition) < CAMERA_SURFACE_SAMPLE_DISTANCE_METERS
+  ) {
+    return false;
+  }
+
+  const patch = createSurfacePatch(geometries);
+  patch.position.copy(position);
+  patch.userData.createdAt = frameTime;
+  scannedSurfaces.add(patch);
+  lastPatchPosition.copy(position);
+
+  while (scannedSurfaces.children.length > MAX_CAMERA_SURFACE_PATCHES) {
+    const oldestPatch = scannedSurfaces.children[0];
+
+    if (!oldestPatch) {
+      break;
+    }
+
+    scannedSurfaces.remove(oldestPatch);
+    disposeSurfacePatchMaterials(oldestPatch);
+  }
+
+  return true;
+}
+
+function createSurfacePatch(geometries: SurfacePatchGeometries) {
+  const patch = new Group();
+  const fillMaterial = new MeshBasicMaterial({
+    color: 0x35f3cf,
+    side: DoubleSide,
+    transparent: true,
+    opacity: 0.16,
+    depthTest: false,
+    depthWrite: false
+  });
+  const lineMaterial = new LineBasicMaterial({
+    color: 0xf9f871,
+    transparent: true,
+    opacity: 0.56,
+    depthTest: false,
+    depthWrite: false
+  });
+
+  patch.add(
+    new Mesh(geometries.fill, fillMaterial),
+    new LineSegments(geometries.grid, lineMaterial)
+  );
+
+  return patch;
+}
+
+function fadeScannedSurfacePatches(scannedSurfaces: Group, frameTime: number) {
+  for (let index = scannedSurfaces.children.length - 1; index >= 0; index -= 1) {
+    const patch = scannedSurfaces.children[index];
+
+    if (!patch) {
+      continue;
+    }
+
+    const createdAt = typeof patch.userData.createdAt === "number" ? patch.userData.createdAt : 0;
+    const ageMs = frameTime - createdAt;
+    const opacityScale = getSurfacePatchOpacityScale(ageMs);
+
+    if (opacityScale <= 0) {
+      scannedSurfaces.remove(patch);
+      disposeSurfacePatchMaterials(patch);
+      continue;
+    }
+
+    setPatchOpacity(patch, opacityScale);
+  }
+}
+
+function disposeSurfacePatchMaterials(object: Object3D) {
+  object.traverse((child) => {
+    const material = (child as Mesh | LineSegments).material;
+
+    if (!material || Array.isArray(material)) {
+      return;
+    }
+
+    material.dispose();
+  });
+}
+
+function getSurfacePatchOpacityScale(ageMs: number) {
+  if (ageMs <= CAMERA_SURFACE_PATCH_HOLD_MS) {
+    return 1;
+  }
+
+  const fadeProgress = (ageMs - CAMERA_SURFACE_PATCH_HOLD_MS) / CAMERA_SURFACE_PATCH_FADE_MS;
+
+  return Math.max(0, 1 - fadeProgress);
+}
+
+function setPatchOpacity(object: Object3D, opacityScale: number) {
+  object.traverse((child) => {
+    const material = (child as Mesh | LineSegments).material;
+
+    if (!material || Array.isArray(material)) {
+      return;
+    }
+
+    material.opacity = ((child as LineSegments).isLineSegments ? 0.56 : 0.16) * opacityScale;
+  });
+}
+
+function createSurfaceGridGeometry(size: number, divisions: number) {
+  const half = size / 2;
+  const positions: number[] = [];
+
+  for (let index = 0; index <= divisions; index += 1) {
+    const offset = -half + (size * index) / divisions;
+    positions.push(-half, 0, offset, half, 0, offset);
+    positions.push(offset, 0, -half, offset, 0, half);
+  }
+
+  const geometry = new BufferGeometry();
+  geometry.setAttribute("position", new Float32BufferAttribute(positions, 3));
+
+  return geometry;
+}
+
+function needsSpatialSensorPermission() {
+  const requestPermission = (
+    globalThis.DeviceOrientationEvent as
+      | { requestPermission?: () => Promise<PermissionState> }
+      | undefined
+  )?.requestPermission;
+
+  return typeof requestPermission === "function";
+}
+
 const CAMERA_FOV_DEGREES = 62;
 /** Assumed height of a hand-held phone above the floor. */
 const CAMERA_HEIGHT_METERS = 1.4;
@@ -657,4 +1024,23 @@ const RETICLE_AIM_NDC_Y = -0.3;
 const MIN_DOWNWARD_RAY_SLOPE = 0.08;
 const MIN_PLACEMENT_DISTANCE_METERS = 0.4;
 const MAX_PLACEMENT_DISTANCE_METERS = 7;
-const ORIENTATION_SMOOTHING = 0.3;
+const ORIENTATION_INPUT_DEADBAND_RADIANS = MathUtils.degToRad(0.35);
+const ORIENTATION_DAMPING_PER_SECOND = 7;
+const POSITION_DAMPING_PER_SECOND = 9;
+const MAX_FRAME_DELTA = 0.05;
+const MOTION_ACCELERATION_DEADBAND = 0.18;
+const MOTION_ACCELERATION_GAIN = 0.42;
+const MOTION_MAX_ACCELERATION = 3.5;
+const MOTION_MAX_DELTA_SECONDS = 0.08;
+const MOTION_VELOCITY_DAMPING_PER_SECOND = 2.8;
+const MOTION_IDLE_DAMPING_PER_SECOND = 5.2;
+const MOTION_STALE_MS = 260;
+const MAX_ESTIMATED_CAMERA_TRANSLATION_METERS = 2.25;
+const FLOOR_SCAN_CONFIRMATION_MS = 650;
+const CAMERA_SURFACE_PATCH_SIZE_METERS = 1.2;
+const CAMERA_SURFACE_PATCH_DIVISIONS = 6;
+const CAMERA_SURFACE_SAMPLE_INTERVAL_MS = 220;
+const CAMERA_SURFACE_SAMPLE_DISTANCE_METERS = 0.3;
+const CAMERA_SURFACE_PATCH_HOLD_MS = 900;
+const CAMERA_SURFACE_PATCH_FADE_MS = 600;
+const MAX_CAMERA_SURFACE_PATCHES = 10;

@@ -124,6 +124,7 @@ export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
 
     try {
       requestPermission();
+      await requestSpatialSensorPermission();
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: {
@@ -135,7 +136,11 @@ export function App({ detectCapabilitiesFn = detectCapabilities }: AppProps) {
       setCameraStream(stream);
       startRuntime();
     } catch {
-      setError(createCameraError("Camera permission was denied or the camera could not start."));
+      setError(
+        createCameraError(
+          "Camera or motion permission was denied. Allow camera and motion access so iOS can scan the floor."
+        )
+      );
     }
   };
 
@@ -452,6 +457,30 @@ function createCameraError(message: string): UserFacingError {
     message,
     recoverable: true
   };
+}
+
+type PermissionRequestConstructor = {
+  requestPermission?: () => Promise<PermissionState>;
+};
+
+async function requestSpatialSensorPermission() {
+  await requestOptionalSensorPermission(globalThis.DeviceOrientationEvent);
+  await requestOptionalSensorPermission(globalThis.DeviceMotionEvent);
+}
+
+async function requestOptionalSensorPermission(sensorEvent: unknown) {
+  const requestPermission = (sensorEvent as PermissionRequestConstructor | undefined)
+    ?.requestPermission;
+
+  if (typeof requestPermission !== "function") {
+    return;
+  }
+
+  const permission = await requestPermission();
+
+  if (permission !== "granted") {
+    throw new Error("Motion permission denied.");
+  }
 }
 
 function createWebXRError(message: string): UserFacingError {

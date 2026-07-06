@@ -33,6 +33,14 @@ import {
 } from "./captureUtils";
 import { getScanHint, MascotOverlayControls, type ScanStatus } from "./MascotOverlayControls";
 import {
+  createMascotVfx,
+  disposeMascotVfx,
+  startMascotAppear,
+  startMascotDisappear,
+  updateMascotVfx,
+  type MascotVfx
+} from "./mascotVfx";
+import {
   alignModelBottomToFloor,
   applyMascotForwardCorrection,
   createMascotContactShadow,
@@ -64,10 +72,16 @@ type CaptureFailureReason =
 interface MascotRuntime {
   mascot: MascotManifestEntry;
   root: Group;
+  contentRoot: Group;
   model: Group;
+  vfx: MascotVfx;
   mixer: AnimationMixer | null;
   loaded: boolean;
   placed: boolean;
+  visible: boolean;
+  modelVisible: boolean;
+  appearStartedAt: number | null;
+  disappearStartedAt: number | null;
 }
 
 interface CaptureFrameOptions {
@@ -283,19 +297,28 @@ export function WebXRSession({
 
         mascots.forEach((manifestEntry) => {
           const root = new Group();
+          const contentRoot = new Group();
           const model = new Group();
+          const vfx = createMascotVfx();
           const contactShadow = createMascotContactShadow();
           root.visible = false;
           root.matrixAutoUpdate = false;
-          root.add(contactShadow, model);
+          contentRoot.add(contactShadow, model);
+          root.add(contentRoot, vfx.group);
           scene.add(root);
           mascotRuntimes.set(manifestEntry.id, {
             mascot: manifestEntry,
             root,
+            contentRoot,
             model,
+            vfx,
             mixer: null,
             loaded: false,
-            placed: false
+            placed: false,
+            visible: false,
+            modelVisible: false,
+            appearStartedAt: null,
+            disappearStartedAt: null
           });
         });
 
@@ -406,6 +429,13 @@ export function WebXRSession({
           setActiveMascotId(mascotId);
           movingMascotIdRef.current = runtime?.placed ? mascotId : null;
           setMovingMascotId(runtime?.placed ? mascotId : null);
+
+          if (runtime?.placed) {
+            runtime.placed = false;
+            runtime.visible = false;
+            startMascotDisappear(runtime, performance.now());
+          }
+
           lastSurfaceStatus = reticle.visible ? "surface-found" : "scanning";
           setStatus(lastSurfaceStatus);
           enterPlacement();
@@ -420,8 +450,14 @@ export function WebXRSession({
           previousFrameTime = frameTime;
           // Only animate mascots that are actually visible in the scene.
           mascotRuntimes.forEach((runtime) => {
-            if (runtime.placed) {
+            const hasActiveVfx = updateMascotVfx(runtime, frameTime);
+
+            if (runtime.placed || hasActiveVfx) {
               runtime.mixer?.update(delta);
+            }
+
+            if (!runtime.placed && !hasActiveVfx && runtime.disappearStartedAt === null) {
+              runtime.root.visible = false;
             }
           });
           fadeScannedSurfacePatches(scannedSurfaces, frameTime, releaseScannedPatch);
@@ -582,6 +618,7 @@ export function WebXRSession({
       placeMascotAtHit(runtime.root, latestHitMatrix);
       runtime.root.visible = true;
       runtime.placed = true;
+      startMascotAppear(runtime, performance.now());
       movingMascotIdRef.current = null;
       setMovingMascotId(null);
 
@@ -643,6 +680,7 @@ export function WebXRSession({
         // Cached model instances share geometry/materials with the model
         // cache; detach them so scene disposal only frees session resources.
         runtime.model.clear();
+        disposeMascotVfx(runtime.vfx);
       });
       surfacePatchPool.forEach(disposeSurfacePatchMaterials);
       surfacePatchPool.length = 0;

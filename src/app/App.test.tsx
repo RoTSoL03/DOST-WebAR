@@ -82,6 +82,14 @@ describe("App", () => {
 
   afterEach(() => {
     window.history.pushState({}, "", "/");
+    Object.defineProperty(globalThis, "DeviceMotionEvent", {
+      configurable: true,
+      value: undefined
+    });
+    Object.defineProperty(globalThis, "DeviceOrientationEvent", {
+      configurable: true,
+      value: undefined
+    });
     useSessionStore.getState().reset();
   });
 
