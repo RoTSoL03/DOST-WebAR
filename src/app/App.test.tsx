@@ -1,6 +1,7 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
+import { createWebXRSessionInit } from "../ar/webxrSessionConfig";
 import { App } from "./App";
 import { useSessionStore } from "../state/sessionStore";
 import type { CapabilityResult } from "../services/capabilities";
@@ -75,6 +76,25 @@ const desktopUnsupportedCapabilities: CapabilityResult = {
 };
 
 describe("App", () => {
+  it("requests progressive WebXR placement and occlusion features", () => {
+    expect(createWebXRSessionInit(null, "optional")).toEqual(
+      expect.objectContaining({
+        requiredFeatures: ["hit-test"],
+        optionalFeatures: expect.arrayContaining([
+          "camera-access",
+          "anchors",
+          "depth-sensing"
+        ]),
+        depthSensing: {
+          usagePreference: ["cpu-optimized", "gpu-optimized"],
+          dataFormatPreference: ["float32", "luminance-alpha", "unsigned-short"],
+          depthTypeRequest: ["smooth", "raw"],
+          matchDepthView: true
+        }
+      })
+    );
+  });
+
   beforeEach(() => {
     window.history.pushState({}, "", "/");
     useSessionStore.getState().reset();

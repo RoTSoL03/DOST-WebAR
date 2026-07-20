@@ -31,6 +31,11 @@ import {
   get2DContext,
   type CapturedPhoto
 } from "./captureUtils";
+import {
+  FloorHitPoseSmoother,
+  getCameraFacingYaw,
+  offsetFloorHitAwayFromViewer
+} from "./floorHitSmoothing";
 import { getScanHint, MascotOverlayControls, type ScanStatus } from "./MascotOverlayControls";
 import {
   createMascotVfx,
@@ -48,6 +53,9 @@ import {
   disposeObjectResources,
   MASCOT_TARGET_HEIGHT_METERS
 } from "./mascotSceneUtils";
+import { PersonSegmentationClient } from "./personSegmentation";
+import { WebXROcclusionController } from "./webxrOcclusion";
+import { XRCameraFrameSampler } from "./xrCameraFrameSampler";
 
 interface WebXRSessionProps {
   mascots: readonly MascotManifestEntry[];
@@ -76,6 +84,10 @@ interface MascotRuntime {
   model: Group;
   vfx: MascotVfx;
   mixer: AnimationMixer | null;
+  anchor: XRAnchor | null;
+  anchorRequestVersion: number;
+  anchorOffset: Vector3;
+  facingYaw: number;
   loaded: boolean;
   placed: boolean;
   visible: boolean;
@@ -92,6 +104,8 @@ interface CaptureFrameOptions {
   frame?: XRFrame;
   referenceSpace: XRReferenceSpace | null;
   xrWebGLBinding: XRWebGLBindingCameraAccess | null;
+  cameraFrameSampler: XRCameraFrameSampler | null;
+  occlusionController: WebXROcclusionController;
   acquireVirtualRenderer: (width: number, height: number) => WebGLRenderer | null;
 }
 
@@ -191,25 +205,39 @@ export function WebXRSession({
     let renderer: WebGLRenderer | null = null;
     let captureRenderer: WebGLRenderer | null = null;
     let hitTestSource: XRHitTestSource | null = null;
+    let floorHitTestSource: XRHitTestSource | null = null;
     let placementReferenceSpace: XRReferenceSpace | null = null;
     let lastSurfaceStatus: ScanStatus = "loading";
     let lastSurfaceSampleTime = 0;
     let previousFrameTime = performance.now();
     let referenceSpaceType: PlacementReferenceSpaceType = "local";
-    let placedCount = 0;
     let captureRequested = false;
     let captureInProgress = false;
     let captureAttemptCount = 0;
     let xrWebGLBinding: XRWebGLBindingCameraAccess | null = null;
+    let cameraFrameSampler: XRCameraFrameSampler | null = null;
+    let personSegmentation: PersonSegmentationClient | null = null;
+    let segmentationStartTimer: number | null = null;
+    let placementFallbackTimer: number | null = null;
+    let lastPlacementTime = Number.NEGATIVE_INFINITY;
+    let occlusionActive = false;
+    let lastDepthFrameTime = Number.NEGATIVE_INFINITY;
+    let lastSegmentationFrameTime = Number.NEGATIVE_INFINITY;
     let cameraCaptureStateSnapshot: CameraCaptureState = "checking";
     let cameraReadbackProbeCount = 0;
     let cameraReadyFrameCount = 0;
     let surfacePreviewStartedAt = 0;
+    let lastValidFloorHitTime = Number.NEGATIVE_INFINITY;
     const lastSurfaceSamplePosition = new Vector3(Number.POSITIVE_INFINITY, 0, 0);
     const surfaceSamplePosition = new Vector3();
     const latestHitMatrix = new Float32Array(16);
+    const biasedFloorHitMatrix = new Float32Array(16);
+    const floorPlacementMatrix = new Float32Array(16);
+    const viewerPosition = new Vector3();
+    const floorPoseSmoother = new FloorHitPoseSmoother();
     const scene = new Scene();
     const camera = new PerspectiveCamera();
+    const occlusionController = new WebXROcclusionController(session);
     const mascotRuntimes = new Map<MascotId, MascotRuntime>();
     const reticle = createReticle();
     // All surface patches share the same geometry; only materials (opacity)
@@ -236,6 +264,64 @@ export function WebXRSession({
       } else {
         disposeSurfacePatchMaterials(patch);
       }
+    };
+
+    const schedulePersonSegmentation = (delayMs: number) => {
+      if (segmentationStartTimer !== null || disposed || personSegmentation) {
+        return;
+      }
+
+      segmentationStartTimer = window.setTimeout(startPersonSegmentation, delayMs);
+    };
+
+    const startPersonSegmentation = () => {
+      segmentationStartTimer = null;
+
+      if (disposed || personSegmentation || !xrWebGLBinding || !renderer) {
+        return;
+      }
+
+      const hasPlacedMascot = Array.from(mascotRuntimes.values()).some(
+        (runtime) => runtime.placed
+      );
+      if (!hasPlacedMascot) {
+        schedulePersonSegmentation(PERSON_SEGMENTATION_RETRY_DELAY_MS);
+        return;
+      }
+
+      try {
+        cameraFrameSampler ??= new XRCameraFrameSampler(
+          renderer.getContext() as WebGL2RenderingContext
+        );
+      } catch {
+        cameraFrameSampler?.dispose();
+        cameraFrameSampler = null;
+        return;
+      }
+
+      personSegmentation = new PersonSegmentationClient({
+        onMask: ({ mask, width, height }) => {
+          occlusionController.updatePersonMask(new Uint8Array(mask), width, height);
+        },
+        onUnavailable: () => occlusionController.clearPersonMask()
+      });
+    };
+
+    const activateOcclusionAfterPlacement = () => {
+      if (occlusionActive || disposed) {
+        return;
+      }
+
+      occlusionActive = true;
+
+      if (!xrWebGLBinding) {
+        return;
+      }
+
+      // Native depth and semantic segmentation solve different problems. Keep
+      // the person mask available even on depth-capable phones so thin limbs,
+      // clothing, and noisy depth pixels still occlude the mascot reliably.
+      schedulePersonSegmentation(PERSON_SEGMENTATION_START_DELAY_MS);
     };
 
     const acquireVirtualRenderer = (width: number, height: number): WebGLRenderer | null => {
@@ -305,6 +391,7 @@ export function WebXRSession({
           root.matrixAutoUpdate = false;
           contentRoot.add(contactShadow, model);
           root.add(contentRoot, vfx.group);
+          occlusionController.patchObject(root);
           scene.add(root);
           mascotRuntimes.set(manifestEntry.id, {
             mascot: manifestEntry,
@@ -313,6 +400,10 @@ export function WebXRSession({
             model,
             vfx,
             mixer: null,
+            anchor: null,
+            anchorRequestVersion: 0,
+            anchorOffset: new Vector3(),
+            facingYaw: 0,
             loaded: false,
             placed: false,
             visible: false,
@@ -344,6 +435,9 @@ export function WebXRSession({
             }
 
             runtime.model.add(instance.scene);
+            // Cached model instances share materials. Clone only this WebXR
+            // instance's materials before adding the session-specific shader.
+            occlusionController.patchObject(instance.scene, { cloneMaterials: true });
             alignModelBottomToFloor(runtime.model, manifestEntry, MASCOT_TARGET_HEIGHT_METERS);
             applyMascotForwardCorrection(runtime.model);
 
@@ -397,6 +491,22 @@ export function WebXRSession({
           throw new Error("Hit testing was not available.");
         }
 
+        // A second ray aimed toward the lower part of the camera view finds
+        // floors sooner when the user is holding the phone near the horizon.
+        // The centered source remains the compatibility fallback.
+        try {
+          floorHitTestSource =
+            (await session.requestHitTestSource({
+              space: viewerSpace,
+              offsetRay: new XRRay(
+                { x: 0, y: 0, z: 0, w: 1 },
+                { x: 0, y: FLOOR_SCAN_RAY_Y, z: -1, w: 0 }
+              )
+            })) ?? null;
+        } catch {
+          floorHitTestSource = null;
+        }
+
         enterPlacement();
         startupStep = "running scanner";
         lastSurfaceStatus = "scanning";
@@ -424,13 +534,17 @@ export function WebXRSession({
 
         selectMascotForPlacementRef.current = (mascotId) => {
           const runtime = mascotRuntimes.get(mascotId);
+          const isRepositioning = placedMascotIdsRef.current.includes(mascotId);
 
           activeMascotIdRef.current = mascotId;
           setActiveMascotId(mascotId);
-          movingMascotIdRef.current = runtime?.placed ? mascotId : null;
-          setMovingMascotId(runtime?.placed ? mascotId : null);
+          movingMascotIdRef.current = isRepositioning ? mascotId : null;
+          setMovingMascotId(isRepositioning ? mascotId : null);
 
-          if (runtime?.placed) {
+          if (runtime && isRepositioning) {
+            runtime.anchorRequestVersion += 1;
+            runtime.anchor?.delete();
+            runtime.anchor = null;
             runtime.placed = false;
             runtime.visible = false;
             startMascotDisappear(runtime, performance.now());
@@ -448,8 +562,48 @@ export function WebXRSession({
 
           const delta = (frameTime - previousFrameTime) / 1000;
           previousFrameTime = frameTime;
+          const activePlacementRuntime = mascotRuntimes.get(activeMascotIdRef.current);
+          const needsPlacementSurface = !activePlacementRuntime?.placed;
+          let hasPlacedMascot = false;
+
+          for (const runtime of mascotRuntimes.values()) {
+            if (runtime.placed) {
+              hasPlacedMascot = true;
+              break;
+            }
+          }
+
+          // Floor scanning keeps priority, but already placed mascots continue
+          // receiving lower-rate occlusion updates while another is positioned.
+          const occlusionThrottleMultiplier = needsPlacementSurface ? 2 : 1;
+
+          if (
+            occlusionActive &&
+            hasPlacedMascot &&
+            frame &&
+            placementReferenceSpace &&
+            frameTime - lastDepthFrameTime >=
+              getDepthIntervalMs(profile) * occlusionThrottleMultiplier
+          ) {
+            occlusionController.updateDepth(frame, placementReferenceSpace);
+            lastDepthFrameTime = frameTime;
+          }
+
           // Only animate mascots that are actually visible in the scene.
           mascotRuntimes.forEach((runtime) => {
+            if (runtime.anchor && frame && placementReferenceSpace) {
+              const anchorPose = frame.getPose(runtime.anchor.anchorSpace, placementReferenceSpace);
+
+              if (anchorPose) {
+                placeMascotAtHit(
+                  runtime.root,
+                  anchorPose.transform.matrix,
+                  runtime.facingYaw,
+                  runtime.anchorOffset
+                );
+              }
+            }
+
             const hasActiveVfx = updateMascotVfx(runtime, frameTime);
 
             if (runtime.placed || hasActiveVfx) {
@@ -462,31 +616,46 @@ export function WebXRSession({
           });
           fadeScannedSurfacePatches(scannedSurfaces, frameTime, releaseScannedPatch);
 
-          const needsPlacementSurface =
-            placedCount < mascots.length || movingMascotIdRef.current !== null;
-
           if (frame && hitTestSource && placementReferenceSpace && needsPlacementSurface) {
-            const hitTestResults = frame.getHitTestResults(hitTestSource);
-            const hit = hitTestResults[0];
-            const pose = hit?.getPose(placementReferenceSpace);
+            const floorHit = getCurrentFloorHit(
+              frame,
+              hitTestSource,
+              floorHitTestSource,
+              placementReferenceSpace,
+              referenceSpaceType,
+              reticle.visible ? floorPoseSmoother.position : null
+            );
+            const pose = floorHit?.pose;
 
             if (pose) {
-              latestHitMatrix.set(pose.transform.matrix);
+              lastValidFloorHitTime = frameTime;
+              if (getViewerPosition(frame, placementReferenceSpace, viewerPosition)) {
+                offsetFloorHitAwayFromViewer(
+                  pose.transform.matrix,
+                  viewerPosition,
+                  FLOOR_FORWARD_BIAS_METERS,
+                  biasedFloorHitMatrix
+                );
+              } else {
+                biasedFloorHitMatrix.set(pose.transform.matrix);
+              }
+              floorPoseSmoother.update(biasedFloorHitMatrix, frameTime, floorPlacementMatrix);
+              latestHitMatrix.set(floorPlacementMatrix);
               reticle.visible = true;
-              reticle.matrix.fromArray(pose.transform.matrix);
+              reticle.matrix.fromArray(floorPlacementMatrix);
               markObjectMatrixDirty(reticle);
 
               if (surfacePreviewStartedAt === 0) {
                 surfacePreviewStartedAt = frameTime;
               }
 
-              surfacePreview.matrix.fromArray(pose.transform.matrix);
+              surfacePreview.matrix.fromArray(floorPlacementMatrix);
               updateSurfacePatchFade(surfacePreview, frameTime - surfacePreviewStartedAt);
               markObjectMatrixDirty(surfacePreview);
               if (
                 sampleScannedSurfacePatch(
                   scannedSurfaces,
-                  pose.transform.matrix,
+                  floorPlacementMatrix,
                   frameTime,
                   surfaceSamplePosition,
                   lastSurfaceSamplePosition,
@@ -499,11 +668,36 @@ export function WebXRSession({
                 lastSurfaceSampleTime = frameTime;
               }
               updateSurfaceState(true);
-            } else {
+            } else if (frameTime - lastValidFloorHitTime > FLOOR_HIT_GRACE_MS) {
               reticle.visible = false;
               surfacePreview.visible = false;
               surfacePreviewStartedAt = 0;
+              floorPoseSmoother.reset();
               updateSurfaceState(false);
+            }
+          }
+
+          if (
+            frame &&
+            occlusionActive &&
+            hasPlacedMascot &&
+            placementReferenceSpace &&
+            xrWebGLBinding &&
+            cameraFrameSampler &&
+            personSegmentation &&
+            frameTime - lastSegmentationFrameTime >=
+              getSegmentationIntervalMs(profile) * occlusionThrottleMultiplier
+          ) {
+            const image = cameraFrameSampler.sample(
+              frame,
+              placementReferenceSpace,
+              xrWebGLBinding,
+              getSegmentationResolution(profile),
+              getSegmentationResolution(profile)
+            );
+
+            if (image && personSegmentation.tryProcess(image, frameTime)) {
+              lastSegmentationFrameTime = frameTime;
             }
           }
 
@@ -542,6 +736,17 @@ export function WebXRSession({
               return;
             }
 
+            if (!cameraFrameSampler && xrWebGLBinding) {
+              try {
+                cameraFrameSampler = new XRCameraFrameSampler(
+                  renderer.getContext() as WebGL2RenderingContext
+                );
+              } catch {
+                cameraFrameSampler?.dispose();
+                cameraFrameSampler = null;
+              }
+            }
+
             captureInProgress = true;
             captureAttemptCount += 1;
             void captureCleanFrame({
@@ -552,6 +757,8 @@ export function WebXRSession({
               frame,
               referenceSpace: placementReferenceSpace,
               xrWebGLBinding,
+              cameraFrameSampler,
+              occlusionController,
               acquireVirtualRenderer
             })
               .then((result) => {
@@ -606,24 +813,87 @@ export function WebXRSession({
       }
     }
 
-    const handleSelect = () => {
+    const placeActiveMascot = (frame: XRFrame | null) => {
       const selectedMascotId = activeMascotIdRef.current;
       const runtime = mascotRuntimes.get(selectedMascotId);
+      const placementTime = performance.now();
 
-      if (!runtime || !runtime.loaded || !reticle.visible) {
+      if (
+        !runtime ||
+        !runtime.loaded ||
+        !reticle.visible ||
+        placementTime - lastPlacementTime < PLACEMENT_DEBOUNCE_MS
+      ) {
         return;
       }
 
+      lastPlacementTime = placementTime;
       const wasPlaced = runtime.placed || placedMascotIdsRef.current.includes(selectedMascotId);
-      placeMascotAtHit(runtime.root, latestHitMatrix);
+      runtime.anchorRequestVersion += 1;
+      const anchorRequestVersion = runtime.anchorRequestVersion;
+      runtime.anchor?.delete();
+      runtime.anchor = null;
+      runtime.anchorOffset.set(0, 0, 0);
+      if (
+        (frame && getViewerPosition(frame, placementReferenceSpace, viewerPosition)) ||
+        getRendererCameraPosition(renderer, viewerPosition)
+      ) {
+        runtime.facingYaw = getCameraFacingYaw(latestHitMatrix, viewerPosition, runtime.facingYaw);
+      }
+      placeMascotAtHit(runtime.root, latestHitMatrix, runtime.facingYaw);
       runtime.root.visible = true;
       runtime.placed = true;
       startMascotAppear(runtime, performance.now());
+      activateOcclusionAfterPlacement();
       movingMascotIdRef.current = null;
       setMovingMascotId(null);
 
+      const selectedFloorHit =
+        frame && hitTestSource && placementReferenceSpace
+          ? getCurrentFloorHit(
+              frame,
+              hitTestSource,
+              floorHitTestSource,
+              placementReferenceSpace,
+              referenceSpaceType,
+              floorPoseSmoother.position
+            )
+          : undefined;
+      const selectedHit = selectedFloorHit?.hit;
+
+      if (selectedFloorHit) {
+        const anchorMatrix = selectedFloorHit.pose.transform.matrix;
+        runtime.anchorOffset.set(
+          (latestHitMatrix[12] ?? 0) - (anchorMatrix[12] ?? 0),
+          (latestHitMatrix[13] ?? 0) - (anchorMatrix[13] ?? 0),
+          (latestHitMatrix[14] ?? 0) - (anchorMatrix[14] ?? 0)
+        );
+      }
+
+      if (selectedHit?.createAnchor) {
+        void selectedHit
+          .createAnchor()
+          .then((anchor) => {
+            if (
+              disposed ||
+              !runtime.placed ||
+              runtime.anchorRequestVersion !== anchorRequestVersion
+            ) {
+              anchor.delete();
+              return;
+            }
+
+            runtime.anchor?.delete();
+            runtime.anchor = anchor;
+          })
+          .catch(() => {
+            // Matrix placement remains active when anchors are unsupported or
+            // the runtime loses tracking during asynchronous creation.
+          });
+      }
+
       if (wasPlaced) {
-        if (placedCount === mascots.length) {
+        if (placedMascotIdsRef.current.length === mascots.length) {
           reticle.visible = false;
           surfacePreview.visible = false;
           lastSurfaceStatus = "placed";
@@ -635,7 +905,6 @@ export function WebXRSession({
         return;
       }
 
-      placedCount += 1;
       markMascotPlaced();
 
       const nextPlacedIds = [...placedMascotIdsRef.current, selectedMascotId];
@@ -657,6 +926,29 @@ export function WebXRSession({
       }
     };
 
+    const handleSelect = (event: XRInputSourceEvent) => {
+      if (placementFallbackTimer !== null) {
+        window.clearTimeout(placementFallbackTimer);
+        placementFallbackTimer = null;
+      }
+
+      placeActiveMascot(event.frame);
+    };
+
+    const handlePointerPlacement = () => {
+      if (placementFallbackTimer !== null || disposed || !reticle.visible) {
+        return;
+      }
+
+      // Chrome normally emits an XR `select` for an AR screen tap. Some
+      // DOM-overlay/device combinations emit only the canvas pointer event, so
+      // use it as a delayed fallback and let `select` win when both arrive.
+      placementFallbackTimer = window.setTimeout(() => {
+        placementFallbackTimer = null;
+        placeActiveMascot(null);
+      }, POINTER_PLACEMENT_FALLBACK_DELAY_MS);
+    };
+
     const handleEnd = () => {
       sessionEnded = true;
       cleanup();
@@ -673,9 +965,22 @@ export function WebXRSession({
       selectMascotForPlacementRef.current = () => undefined;
       session.removeEventListener("select", handleSelect);
       session.removeEventListener("end", handleEnd);
+      xrCanvas.removeEventListener("pointerup", handlePointerPlacement);
       renderer?.setAnimationLoop(null);
       hitTestSource?.cancel();
+      floorHitTestSource?.cancel();
+      if (segmentationStartTimer !== null) {
+        window.clearTimeout(segmentationStartTimer);
+        segmentationStartTimer = null;
+      }
+      if (placementFallbackTimer !== null) {
+        window.clearTimeout(placementFallbackTimer);
+        placementFallbackTimer = null;
+      }
       mascotRuntimes.forEach((runtime) => {
+        runtime.anchorRequestVersion += 1;
+        runtime.anchor?.delete();
+        runtime.anchor = null;
         runtime.mixer?.stopAllAction();
         // Cached model instances share geometry/materials with the model
         // cache; detach them so scene disposal only frees session resources.
@@ -687,12 +992,16 @@ export function WebXRSession({
       disposeObjectResources(scene);
       patchGeometries.fill.dispose();
       patchGeometries.grid.dispose();
+      personSegmentation?.dispose();
+      cameraFrameSampler?.dispose();
+      occlusionController.dispose();
       captureRenderer?.dispose();
       renderer?.dispose();
     }
 
     session.addEventListener("select", handleSelect);
     session.addEventListener("end", handleEnd);
+    xrCanvas.addEventListener("pointerup", handlePointerPlacement);
     void startWebXR();
 
     return () => {
@@ -940,6 +1249,8 @@ async function captureCleanFrame({
   frame,
   referenceSpace,
   xrWebGLBinding,
+  cameraFrameSampler,
+  occlusionController,
   acquireVirtualRenderer
 }: CaptureFrameOptions): Promise<CaptureResult> {
   const previousVisibility = hiddenObjects.map((object) => object.visible);
@@ -952,24 +1263,48 @@ async function captureCleanFrame({
 
   try {
     const gl = renderer.getContext();
-    const { image: cameraImage, failureReason } = readRawCameraImage(
-      frame,
-      referenceSpace,
-      xrWebGLBinding,
-      gl
-    );
+    const captureSize = getCaptureCameraSize(frame, referenceSpace, CAPTURE_MAX_EDGE_PIXELS);
+    const sampledCameraImage =
+      frame && referenceSpace && xrWebGLBinding
+        ? cameraFrameSampler?.sample(
+            frame,
+            referenceSpace,
+            xrWebGLBinding,
+            captureSize?.width,
+            captureSize?.height
+          )
+        : null;
+    const { image: fallbackCameraImage, failureReason } = sampledCameraImage
+      ? { image: null, failureReason: undefined }
+      : readRawCameraImage(frame, referenceSpace, xrWebGLBinding, gl);
+    const cameraImage = sampledCameraImage
+      ? {
+          imageData: sampledCameraImage,
+          width: sampledCameraImage.width,
+          height: sampledCameraImage.height
+        }
+      : fallbackCameraImage;
 
     if (!cameraImage) {
       throw createCaptureError(failureReason ?? "Camera texture unavailable");
     }
 
-    const virtualImage = renderVirtualSceneImage(
-      acquireVirtualRenderer,
-      scene,
-      getCurrentXRCaptureCamera(renderer, camera),
-      cameraImage.width,
-      cameraImage.height
-    );
+    let virtualImage: ReadableFrameImage | null = null;
+    occlusionController.setEnabled(false);
+    try {
+      // Live XR occlusion UVs are not guaranteed to match the offscreen photo
+      // framebuffer. Render a complete mascot layer for capture rather than
+      // allowing mismatched depth/mask pixels to erase parts of the model.
+      virtualImage = renderVirtualSceneImage(
+        acquireVirtualRenderer,
+        scene,
+        getCurrentXRCaptureCamera(renderer, camera),
+        cameraImage.width,
+        cameraImage.height
+      );
+    } finally {
+      occlusionController.setEnabled(true);
+    }
 
     return {
       blob: await composeCaptureBlob(cameraImage, virtualImage)
@@ -1000,6 +1335,32 @@ function getCurrentXRCaptureCamera(renderer: WebGLRenderer, fallbackCamera: Came
   const firstSubCamera = (xrCamera as unknown as { cameras?: Camera[] }).cameras?.[0];
 
   return firstSubCamera ?? xrCamera ?? fallbackCamera;
+}
+
+function getCaptureCameraSize(
+  frame: XRFrame | undefined,
+  referenceSpace: XRReferenceSpace | null,
+  maximumEdge: number
+) {
+  if (!frame || !referenceSpace) {
+    return null;
+  }
+
+  try {
+    const camera = frame.getViewerPose(referenceSpace)?.views.find((view) => view.camera)?.camera;
+
+    if (!camera || camera.width <= 0 || camera.height <= 0) {
+      return null;
+    }
+
+    const scale = Math.min(1, maximumEdge / Math.max(camera.width, camera.height));
+    return {
+      width: Math.max(1, Math.round(camera.width * scale)),
+      height: Math.max(1, Math.round(camera.height * scale))
+    };
+  } catch {
+    return null;
+  }
 }
 
 function renderVirtualSceneImage(
@@ -1254,9 +1615,60 @@ function shouldRetryCapture(reason: CaptureFailureReason, attemptCount: number) 
   return attemptCount < CAPTURE_RETRY_FRAME_LIMIT && reason !== "Capture image encoding failed";
 }
 
-function placeMascotAtHit(mascotRoot: Group, hitMatrix: Float32Array) {
-  mascotRoot.matrix.fromArray(hitMatrix);
+function placeMascotAtHit(
+  mascotRoot: Group,
+  hitMatrix: ArrayLike<number>,
+  facingYaw: number,
+  positionOffset?: Vector3
+) {
+  // World-placement mascots always stand upright. Hit-test and anchor normals
+  // can be noisy or inverted even when their position correctly lies on the
+  // floor, so preserve only the tracked translation and camera-facing yaw.
+  mascotRoot.matrix.makeRotationY(facingYaw);
+  mascotRoot.matrix.setPosition(
+    (hitMatrix[12] ?? 0) + (positionOffset?.x ?? 0),
+    (hitMatrix[13] ?? 0) + (positionOffset?.y ?? 0),
+    (hitMatrix[14] ?? 0) + (positionOffset?.z ?? 0)
+  );
   markObjectMatrixDirty(mascotRoot);
+}
+
+function getViewerPosition(
+  frame: XRFrame,
+  referenceSpace: XRReferenceSpace | null,
+  target: Vector3
+) {
+  if (!referenceSpace) {
+    return false;
+  }
+
+  let viewerMatrix: Float32Array | undefined;
+
+  try {
+    viewerMatrix = frame.getViewerPose(referenceSpace)?.views[0]?.transform.matrix;
+  } catch {
+    return false;
+  }
+
+  if (!viewerMatrix) {
+    return false;
+  }
+
+  target.set(viewerMatrix[12] ?? 0, viewerMatrix[13] ?? 0, viewerMatrix[14] ?? 0);
+  return true;
+}
+
+function getRendererCameraPosition(renderer: WebGLRenderer | null, target: Vector3) {
+  if (!renderer) {
+    return false;
+  }
+
+  try {
+    renderer.xr.getCamera().getWorldPosition(target);
+  } catch {
+    return false;
+  }
+  return Number.isFinite(target.x) && Number.isFinite(target.y) && Number.isFinite(target.z);
 }
 
 function markObjectMatrixDirty(object: Object3D) {
@@ -1282,14 +1694,100 @@ function createSurfaceGridGeometry(size: number, divisions: number) {
   return geometry;
 }
 
+function getCurrentFloorHit(
+  frame: XRFrame,
+  centeredSource: XRHitTestSource,
+  floorSource: XRHitTestSource | null,
+  referenceSpace: XRReferenceSpace,
+  referenceSpaceType: PlacementReferenceSpaceType,
+  preferredPosition: Vector3 | null
+) {
+  try {
+    return findBestFloorHit(
+      [
+        ...(floorSource ? frame.getHitTestResults(floorSource) : []),
+        ...frame.getHitTestResults(centeredSource)
+      ],
+      referenceSpace,
+      referenceSpaceType,
+      preferredPosition
+    );
+  } catch {
+    return null;
+  }
+}
+
+function findBestFloorHit(
+  hitTestResults: readonly XRHitTestResult[],
+  referenceSpace: XRReferenceSpace,
+  referenceSpaceType: PlacementReferenceSpaceType,
+  preferredPosition: Vector3 | null
+): { hit: XRHitTestResult; pose: XRPose } | null {
+  let bestHit: { hit: XRHitTestResult; pose: XRPose } | null = null;
+  let bestScore = Number.NEGATIVE_INFINITY;
+
+  for (const hit of hitTestResults) {
+    const pose = hit.getPose(referenceSpace);
+
+    if (!pose) {
+      continue;
+    }
+
+    const matrix = pose.transform.matrix;
+    // The hit-test pose's local Y axis is the estimated surface normal. Depth
+    // and feature-point normals can be noisy, and some runtimes flip the sign,
+    // so compare the absolute up component instead of demanding near-perfect
+    // +Y alignment.
+    const upwardAlignment = Math.abs(matrix[5] ?? 0);
+    const floorHeight = Math.abs(matrix[13] ?? 0);
+
+    const nearKnownFloor =
+      referenceSpaceType === "local-floor" && floorHeight <= FLOOR_MAX_HEIGHT_METERS;
+
+    if (!nearKnownFloor && upwardAlignment < FLOOR_MINIMUM_NORMAL_ALIGNMENT) {
+      continue;
+    }
+
+    const continuityDistance = preferredPosition
+      ? Math.hypot(
+          (matrix[12] ?? 0) - preferredPosition.x,
+          (matrix[13] ?? 0) - preferredPosition.y,
+          (matrix[14] ?? 0) - preferredPosition.z
+        )
+      : 0;
+    const score =
+      upwardAlignment * 2 +
+      (nearKnownFloor ? 2 - floorHeight : 0) -
+      Math.min(continuityDistance, 2) * FLOOR_CONTINUITY_WEIGHT;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestHit = { hit, pose };
+    }
+  }
+
+  return bestHit;
+}
+
 const SURFACE_PATCH_SIZE_METERS = 1.2;
 const SURFACE_PATCH_DIVISIONS = 6;
 const SURFACE_SAMPLE_DISTANCE_METERS = 0.28;
 const SURFACE_PATTERN_HOLD_MS = 1000;
 const SURFACE_PATTERN_FADE_MS = 500;
+const FLOOR_SCAN_RAY_Y = -0.35;
+const FLOOR_MINIMUM_NORMAL_ALIGNMENT = 0.6;
+const FLOOR_MAX_HEIGHT_METERS = 0.45;
+const FLOOR_CONTINUITY_WEIGHT = 2.5;
+const FLOOR_HIT_GRACE_MS = 350;
+const FLOOR_FORWARD_BIAS_METERS = 0.35;
+const POINTER_PLACEMENT_FALLBACK_DELAY_MS = 90;
+const PLACEMENT_DEBOUNCE_MS = 300;
+const PERSON_SEGMENTATION_START_DELAY_MS = 350;
+const PERSON_SEGMENTATION_RETRY_DELAY_MS = 500;
 const CAMERA_READBACK_PROBE_FRAME_LIMIT = 90;
 const CAMERA_READY_FRAME_THRESHOLD = 4;
 const CAPTURE_RETRY_FRAME_LIMIT = 45;
+const CAPTURE_MAX_EDGE_PIXELS = 1280;
 const CAPTURE_FAILURE_REASONS: readonly CaptureFailureReason[] = [
   "Camera view missing",
   "Camera texture unavailable",
@@ -1299,6 +1797,38 @@ const CAPTURE_FAILURE_REASONS: readonly CaptureFailureReason[] = [
   "Camera image was blank",
   "Capture image encoding failed"
 ];
+
+function getSegmentationIntervalMs(profile: QualityProfile) {
+  if (profile.tier === "high") {
+    return 1000 / 6;
+  }
+
+  if (profile.tier === "mid") {
+    return 1000 / 4;
+  }
+
+  return 1000 / 3;
+}
+
+function getSegmentationResolution(profile: QualityProfile) {
+  if (profile.tier === "high") {
+    return 224;
+  }
+
+  return profile.tier === "mid" ? 176 : 144;
+}
+
+function getDepthIntervalMs(profile: QualityProfile) {
+  if (profile.tier === "high") {
+    return 1000 / 20;
+  }
+
+  if (profile.tier === "mid") {
+    return 1000 / 15;
+  }
+
+  return 1000 / 10;
+}
 
 async function requestPlacementReferenceSpaceType(
   session: XRSession

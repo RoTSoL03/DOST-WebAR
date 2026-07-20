@@ -5,6 +5,10 @@ import { mascotManifest } from "../config/mascots";
 import { createCapabilityCheckError, type UserFacingError } from "../errors/userFacingError";
 import { detectCapabilities, type CapabilityResult } from "../services/capabilities";
 import { useSessionStore } from "../state/sessionStore";
+import {
+  createWebXRSessionInit,
+  type CameraAccessMode
+} from "../ar/webxrSessionConfig";
 
 const ImageTrackingSession = lazy(() =>
   import("../ar/ImageTrackingSession").then((module) => ({ default: module.ImageTrackingSession }))
@@ -303,37 +307,6 @@ async function requestWebXRSession(
   }
 
   throw lastError instanceof Error ? lastError : new Error("WebXR requestSession failed.");
-}
-
-type CameraAccessMode = "required" | "optional";
-
-function createWebXRSessionInit(
-  domOverlayRoot: HTMLElement | null,
-  cameraAccessMode: CameraAccessMode
-): XRSessionInit {
-  const requiredFeatures = ["hit-test"];
-  const optionalFeatures = ["local-floor", "local"];
-
-  if (cameraAccessMode === "required") {
-    requiredFeatures.push("camera-access");
-  } else {
-    optionalFeatures.push("camera-access");
-  }
-
-  if (domOverlayRoot) {
-    optionalFeatures.push("dom-overlay");
-  }
-
-  const sessionInit: XRSessionInit = {
-    requiredFeatures,
-    optionalFeatures
-  };
-
-  if (domOverlayRoot) {
-    sessionInit.domOverlay = { root: domOverlayRoot };
-  }
-
-  return sessionInit;
 }
 
 function createWebXROverlayRoot() {

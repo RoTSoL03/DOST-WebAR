@@ -135,16 +135,23 @@ unsupported
 3. Start session only from user gesture.
 4. Request required features:
    - `hit-test`
-   - `local` or `local-floor` reference space
 5. Request optional features where available:
    - `dom-overlay`
-   - anchors if supported and justified
-6. Create hit-test source.
-7. Render placement reticle while a surface is detected.
-8. Place mascot on user tap.
-9. Keep mascot transform editable.
-10. Pause/resume when session visibility changes.
-11. End session and dispose resources.
+   - `local-floor` / `local` reference spaces
+   - `anchors`
+   - `depth-sensing` (CPU depth preferred)
+   - `camera-access` for local person segmentation and photo capture
+6. Create a centered hit-test source plus a downward-biased floor source when `XRRay` is supported.
+7. Score all returned poses using floor height and horizontal alignment; do not delay valid hits behind a multi-frame stability gate.
+8. Render the placement reticle immediately, apply a dead zone plus speed-limited temporal smoothing, and retain its last valid floor pose briefly across intermittent ARCore frames.
+9. Place mascot on user tap and create a native anchor when supported; retain matrix placement as fallback.
+10. Occlude the mascot with feathered WebXR CPU depth plus an on-device MediaPipe person mask with soft temporal/spatial edges, so people remain foreground even where native depth is noisy around limbs, hair, or clothing.
+11. For photo capture, temporarily disable live-view depth/mask shader coordinates in the separate offscreen renderer so a mismatched capture framebuffer cannot erase mascot pixels.
+12. Keep mascot transform editable.
+13. Pause/resume when session visibility changes.
+14. End session and dispose anchors, textures, workers, and render resources.
+
+The person-segmentation model and WASM runtime are self-hosted and loaded only by the markerless `WebXRSession`, after the first mascot is placed. Native depth and the semantic person mask then run together; both use a reduced update cadence while another mascot is being placed or repositioned so floor scanning retains priority. The image/card recognition experience is not coupled to this pipeline.
 
 ## iOS Camera-Composition Runtime Lifecycle
 
@@ -255,4 +262,3 @@ Minimum supported platform baselines:
 - iOS 17+.
 
 Representative test devices are defined in `docs/DeviceSupportMatrix.md`.
-

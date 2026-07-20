@@ -1,9 +1,18 @@
 type XRSessionMode = "immersive-ar";
 type XRReferenceSpaceType = "local" | "local-floor" | "viewer";
+type XRDepthUsage = "cpu-optimized" | "gpu-optimized";
+type XRDepthDataFormat = "luminance-alpha" | "float32" | "unsigned-short";
+type XRDepthType = "raw" | "smooth";
 
 interface XRSessionInit {
   requiredFeatures?: string[];
   optionalFeatures?: string[];
+  depthSensing?: {
+    usagePreference: XRDepthUsage[];
+    dataFormatPreference: XRDepthDataFormat[];
+    depthTypeRequest?: XRDepthType[];
+    matchDepthView?: boolean;
+  };
   domOverlay?: {
     root: Element;
   };
@@ -12,10 +21,13 @@ interface XRSessionInit {
 interface XRFrame {
   getHitTestResults(hitTestSource: XRHitTestSource): XRHitTestResult[];
   getViewerPose(referenceSpace: XRReferenceSpace): XRViewerPose | null;
+  getPose(space: XRSpace, baseSpace: XRSpace): XRPose | null;
+  getDepthInformation?(view: XRView): XRCPUDepthInformation | null;
 }
 
 interface XRHitTestOptionsInit {
   space: XRSpace;
+  offsetRay?: XRRay;
 }
 
 interface XRHitTestSource {
@@ -24,6 +36,7 @@ interface XRHitTestSource {
 
 interface XRHitTestResult {
   getPose(baseSpace: XRSpace): XRPose | null;
+  createAnchor?: () => Promise<XRAnchor>;
 }
 
 interface XRInputSourceEvent extends Event {
@@ -37,6 +50,11 @@ interface XRRenderStateInit {
 }
 
 interface XRSession extends EventTarget {
+  readonly enabledFeatures?: readonly string[];
+  readonly depthUsage?: XRDepthUsage;
+  readonly depthDataFormat?: XRDepthDataFormat;
+  readonly depthType?: XRDepthType | null;
+  readonly depthActive?: boolean | null;
   end(): Promise<void>;
   requestHitTestSource(options: XRHitTestOptionsInit): Promise<XRHitTestSource | null>;
   requestReferenceSpace(type: XRReferenceSpaceType): Promise<XRReferenceSpace>;
@@ -48,6 +66,11 @@ interface XRSession extends EventTarget {
 }
 
 type XRSpace = object;
+
+interface XRAnchor {
+  readonly anchorSpace: XRSpace;
+  delete(): void;
+}
 
 interface XRPose {
   transform: XRRigidTransform;
@@ -70,6 +93,15 @@ interface XRCamera {
 
 interface XRRigidTransform {
   matrix: Float32Array;
+}
+
+interface XRCPUDepthInformation {
+  readonly data: ArrayBuffer;
+  readonly width: number;
+  readonly height: number;
+  readonly normDepthBufferFromNormView: XRRigidTransform;
+  readonly rawValueToMeters: number;
+  getDepthInMeters(x: number, y: number): number;
 }
 
 interface XRSystem {

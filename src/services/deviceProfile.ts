@@ -23,27 +23,27 @@ export interface DeviceProfileEnvironment {
 const QUALITY_PROFILES: Record<DeviceTier, QualityProfile> = {
   high: {
     tier: "high",
-    maxPixelRatio: 2,
-    antialias: true,
-    xrFramebufferScale: 1,
-    maxScannedSurfacePatches: 16,
-    surfaceSampleIntervalMs: 220
-  },
-  mid: {
-    tier: "mid",
     maxPixelRatio: 1.5,
     antialias: true,
     xrFramebufferScale: 0.85,
     maxScannedSurfacePatches: 10,
-    surfaceSampleIntervalMs: 320
+    surfaceSampleIntervalMs: 280
+  },
+  mid: {
+    tier: "mid",
+    maxPixelRatio: 1.25,
+    antialias: false,
+    xrFramebufferScale: 0.7,
+    maxScannedSurfacePatches: 6,
+    surfaceSampleIntervalMs: 380
   },
   low: {
     tier: "low",
     maxPixelRatio: 1,
     antialias: false,
-    xrFramebufferScale: 0.7,
-    maxScannedSurfacePatches: 6,
-    surfaceSampleIntervalMs: 420
+    xrFramebufferScale: 0.55,
+    maxScannedSurfacePatches: 4,
+    surfaceSampleIntervalMs: 500
   }
 };
 
@@ -56,9 +56,8 @@ export function classifyDeviceTier(environment: DeviceProfileEnvironment): Devic
   const isLowEndGpu = /adreno \(tm\) [345]\d\d|adreno [345]\d\d|mali-4\d\d|mali-t\d\d|powervr/.test(
     gpu
   );
-  const isHighEndGpu = /adreno \(tm\) 7|adreno 7|adreno \(tm\) 6[6-9]|immortalis|mali-g7|apple/.test(
-    gpu
-  );
+  const isHighEndGpu =
+    /adreno \(tm\) 7|adreno 7|adreno \(tm\) 6[6-9]|immortalis|mali-g7|apple/.test(gpu);
 
   let score = 0;
 

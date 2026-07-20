@@ -39,6 +39,7 @@ Analytics must be disabled by default in production until approval is granted.
 - No account creation.
 - No backend image processing.
 - No unnecessary third-party scripts.
+- Human segmentation runs locally in a Web Worker using self-hosted model and WASM assets; camera-frame buffers are never transmitted.
 - Content Security Policy should be configured before production.
 
 ## Threat Considerations
@@ -62,4 +63,3 @@ Mitigation: request camera only from an explicit user action and explain why it 
 ## Compliance Notes
 
 The implementation should be designed to support review under the Philippine Data Privacy Act and DOST organizational security policies.
-

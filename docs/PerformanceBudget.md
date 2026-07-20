@@ -38,6 +38,13 @@
 - Cap mobile device pixel ratio dynamically.
 - Reduce shadow complexity or disable dynamic shadows on weak devices.
 - Pause work when the session is hidden or ended.
+- Keep depth processing and the segmentation worker inactive until the first mascot is placed. During later placement or repositioning passes, halve their update cadence so floor hit testing owns most of the scan-phase frame budget.
+- Combine native CPU depth with the MediaPipe person mask: depth handles world geometry while the semantic mask preserves human occlusion around noisy depth edges.
+- Run person segmentation in a worker at 224/176/144 square resolution and 6/4/3 FPS on high/mid/low tiers.
+- Throttle CPU depth uploads to 20/15/10 FPS on high/mid/low tiers.
+- Transfer sampled camera buffers directly to the worker and perform the vertical flip in the GPU sampling pass to avoid redundant per-frame copies.
+- Copy only the downsampled camera frame for inference and cap explicit photo capture at a 1280-pixel longest edge to avoid Android GPU/readback memory spikes.
+- Prefer WebXR CPU depth when available and share one depth texture and one person-mask texture across all mascot materials.
 
 ## Memory Strategy
 
@@ -60,4 +67,3 @@ Implementation should expose development-only metrics:
 - Runtime errors.
 
 Production analytics must remain disabled unless approved by DOST.
-

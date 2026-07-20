@@ -53,10 +53,21 @@ Required capabilities:
 | Edge Mobile Android | WebXR if available, otherwise fallback | Validate behavior during QA. |
 | iPhone Safari | Camera-composition fallback | MVP remains fully in-browser. |
 
+## Markerless Occlusion Tiers
+
+| Available capability | First Experience behavior |
+| --- | --- |
+| WebXR depth sensing | Geometry and people in front of the mascot occlude it per pixel. |
+| Camera access but no readable depth | On-device person segmentation lets people occlude the mascot; room geometry does not. |
+| Neither depth nor camera texture access | Stable hit-test placement and anchors remain available without real-world occlusion. |
+
+iPhone Safari continues to use the camera-composition fallback and does not gain equivalent world-locked placement or WebXR depth from this change.
+
 ## Acceptance Criteria
 
 - Android WebXR path starts, detects a placement surface, places mascot, transforms mascot, captures photo.
+- On a depth-capable Android test device, a person and nearer room geometry correctly pass in front of the mascot without obvious edge flicker.
+- On an Android device without exposed depth, the person-mask fallback correctly places a person in front of the mascot.
 - iOS fallback starts camera, displays mascot overlay, transforms mascot, captures photo.
 - Unsupported devices receive clear guidance.
 - No browser path requires native app installation.
-
