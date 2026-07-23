@@ -680,7 +680,7 @@ export function CameraARSession({ mascots, stream, onEnd }: CameraARSessionProps
         }}
       >
         <button className="camera-end-button" type="button" onClick={onEnd}>
-          End
+          ← Back
         </button>
         <p className="camera-scan-hint" role="status">
           {getScanHint(status, allPlaced && !isMovingPlacedMascot, activeMascotName)}

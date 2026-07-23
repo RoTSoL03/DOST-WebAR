@@ -10,7 +10,7 @@ vi.mock("../ar/WebXRSession", () => ({
   WebXRSession: ({ onEnd }: { onEnd: () => void }) => (
     <div data-testid="webxr-session">
       <button type="button" onClick={onEnd}>
-        End XR
+        Back
       </button>
     </div>
   )
@@ -20,7 +20,7 @@ vi.mock("../ar/CameraARSession", () => ({
   CameraARSession: ({ onEnd }: { onEnd: () => void }) => (
     <div data-testid="camera-ar-session">
       <button type="button" onClick={onEnd}>
-        End Camera
+        Back
       </button>
     </div>
   )
@@ -173,7 +173,8 @@ describe("App", () => {
   });
 
   it("starts the iOS camera-composition session from the ready screen", async () => {
-    const getUserMedia = vi.fn().mockResolvedValue({ getTracks: () => [] });
+    const stop = vi.fn();
+    const getUserMedia = vi.fn().mockResolvedValue({ getTracks: () => [{ stop }] });
     Object.defineProperty(globalThis.navigator, "mediaDevices", {
       configurable: true,
       value: { getUserMedia }
@@ -203,6 +204,11 @@ describe("App", () => {
     });
     expect(await screen.findByTestId("camera-ar-session")).toBeInTheDocument();
     expect(screen.queryByTestId("webxr-session")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Back" }));
+
+    expect(await screen.findByTestId("ready-screen")).toBeInTheDocument();
+    expect(stop).toHaveBeenCalledOnce();
   });
 
   it("starts WebXR from the ready screen without requesting camera fallback media", async () => {

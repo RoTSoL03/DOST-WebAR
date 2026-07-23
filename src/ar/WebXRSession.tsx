@@ -1048,6 +1048,9 @@ export function WebXRSession({
         setCaptureStatus("idle");
       }}
     >
+      <button className="camera-end-button" type="button" onClick={() => void session.end()}>
+        ← Back
+      </button>
       <p className="camera-scan-hint" role="status">
         {getScanHint(status, allPlaced && !isMovingPlacedMascot, activeMascotName)}
       </p>

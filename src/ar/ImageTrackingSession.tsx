@@ -11,10 +11,8 @@ import {
   MathUtils,
   Points,
   PointsMaterial,
-  Quaternion,
   Sprite,
   SpriteMaterial,
-  Vector3,
   WebGLRenderer
 } from "three";
 
@@ -29,6 +27,7 @@ import {
   get2DContext,
   type CapturedPhoto
 } from "./captureUtils";
+import { SmoothedImageAnchorBinding } from "./imageTrackingAnchorBinding";
 import {
   alignModelBottomToFloor,
   applyMascotForwardCorrection,
@@ -42,29 +41,22 @@ interface ImageTrackingSessionProps {
   onBack: () => void;
 }
 
-type TrackingStatus =
-  | "initializing"
-  | "searching"
-  | "loading-model"
-  | "found"
-  | "lost"
-  | "error";
+type TrackingStatus = "initializing" | "searching" | "loading-model" | "found" | "lost" | "error";
 type CaptureStatus = "idle" | "capturing" | "ready" | "failed";
 
 interface ActiveImageRuntime {
   target: ImageTrackingTarget;
-  anchor: MindARAnchor;
   root: Group;
   standRoot: Group;
   model: Group;
   vfx: MascotVfx;
+  poseBinding: SmoothedImageAnchorBinding;
   mixer: AnimationMixer | null;
   loaded: boolean;
   visible: boolean;
+  hasBeenTracked: boolean;
   modelVisible: boolean;
-  poseInitialized: boolean;
   appearStartedAt: number | null;
-  disappearStartedAt: number | null;
   ownsModelResources: boolean;
 }
 
@@ -110,10 +102,6 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
     let previousFrameTime = performance.now();
     let captureInProgress = false;
     const profile = resolveQualityProfile();
-    const anchorPosition = new Vector3();
-    const anchorQuaternion = new Quaternion();
-    const anchorScale = new Vector3();
-    const targetScale = new Vector3();
 
     const setError = (message: string) => {
       if (!disposed) {
@@ -163,10 +151,6 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
       setActiveTargetName(null);
     };
 
-    const applyRuntimePose = (runtime: ActiveImageRuntime, delta = 1 / 60) => {
-      updateRuntimePose(runtime, delta, anchorPosition, anchorQuaternion, anchorScale, targetScale);
-    };
-
     const prepareTargetRuntime = async (target: ImageTrackingTarget, anchor: MindARAnchor) => {
       setTrackingStatus("loading-model");
       setStatusMessage("Preparing AR...");
@@ -181,22 +165,21 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
       standRoot.add(createMascotContactShadow(), model);
       root.add(standRoot);
       root.add(vfx.group);
-      mindarRef.current?.scene.add(root);
+      const poseBinding = new SmoothedImageAnchorBinding(anchor.group, root);
 
       const runtime: ActiveImageRuntime = {
         target,
-        anchor,
         root,
         standRoot,
         model,
         vfx,
+        poseBinding,
         mixer: null,
         loaded: false,
         visible: anchor.visible,
+        hasBeenTracked: false,
         modelVisible: false,
-        poseInitialized: false,
         appearStartedAt: null,
-        disappearStartedAt: null,
         ownsModelResources: false
       };
       activeRuntimesRef.current.set(target.targetIndex, runtime);
@@ -241,11 +224,19 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
       const runtime = activeRuntimesRef.current.get(target.targetIndex);
 
       if (runtime) {
+        const isReacquiring = runtime.hasBeenTracked;
+
         hasTrackedTarget = true;
         runtime.visible = true;
-        runtime.poseInitialized = false;
-        applyRuntimePose(runtime);
-        startMascotAppear(runtime, performance.now());
+        runtime.hasBeenTracked = true;
+
+        if (isReacquiring) {
+          runtime.poseBinding.beginReacquisition();
+          resumeMascotAfterReacquisition(runtime);
+        } else {
+          startMascotAppear(runtime, performance.now());
+        }
+
         updateTrackingSummary();
         return;
       }
@@ -259,7 +250,7 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
       }
 
       runtime.visible = false;
-      startMascotDisappear(runtime, performance.now());
+      hideMascotAfterTrackingLoss(runtime);
       updateTrackingSummary();
     };
 
@@ -269,12 +260,7 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
       const renderer = mindar?.renderer;
       const visibleRuntimes = getVisibleRuntimes(activeRuntimesRef.current);
 
-      if (
-        captureInProgress ||
-        !video ||
-        !renderer ||
-        visibleRuntimes.length === 0
-      ) {
+      if (captureInProgress || !video || !renderer || visibleRuntimes.length === 0) {
         return;
       }
 
@@ -347,9 +333,8 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
       }
 
       try {
-        const { MindARThree: MindARThreeRuntime } = await import(
-          "../vendor/mindar/mindar-image-three.prod.js"
-        );
+        const { MindARThree: MindARThreeRuntime } =
+          await import("../vendor/mindar/mindar-image-three.prod.js");
 
         if (disposed) {
           return;
@@ -368,7 +353,9 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
           missTolerance: TRACKING_MISS_TOLERANCE
         });
         mindarRef.current = mindar;
-        mindar.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, profile.maxPixelRatio));
+        mindar.renderer.setPixelRatio(
+          Math.min(window.devicePixelRatio || 1, profile.maxPixelRatio)
+        );
         mindar.renderer.setClearColor(0x000000, 0);
 
         mindar.scene.add(new AmbientLight(0xffffff, 1.5));
@@ -412,11 +399,11 @@ export function ImageTrackingSession({ config, onBack }: ImageTrackingSessionPro
           const delta = (frameTime - previousFrameTime) / 1000;
           previousFrameTime = frameTime;
           activeRuntimesRef.current.forEach((runtime) => {
-            const hasActiveVfx = updateMascotVfx(runtime, frameTime);
-
             if (runtime.visible) {
-              applyRuntimePose(runtime, delta);
+              runtime.poseBinding.update(delta);
             }
+
+            const hasActiveVfx = updateMascotVfx(runtime, frameTime);
 
             if (runtime.visible || hasActiveVfx) {
               runtime.mixer?.update(delta);
@@ -697,19 +684,25 @@ function startMascotAppear(runtime: ActiveImageRuntime, frameTime: number) {
   runtime.standRoot.scale.setScalar(APPEAR_MODEL_START_SCALE);
   runtime.modelVisible = false;
   runtime.appearStartedAt = frameTime;
-  runtime.disappearStartedAt = null;
   runtime.vfx.group.visible = true;
   updateMascotVfx(runtime, frameTime);
 }
 
-function startMascotDisappear(runtime: ActiveImageRuntime, frameTime: number) {
+function hideMascotAfterTrackingLoss(runtime: ActiveImageRuntime) {
+  runtime.appearStartedAt = null;
+  runtime.root.visible = false;
   runtime.standRoot.visible = false;
   runtime.modelVisible = false;
+  runtime.vfx.group.visible = false;
+}
+
+function resumeMascotAfterReacquisition(runtime: ActiveImageRuntime) {
   runtime.appearStartedAt = null;
-  runtime.disappearStartedAt = frameTime;
-  runtime.vfx.group.visible = true;
-  runtime.root.visible = true;
-  updateMascotVfx(runtime, frameTime);
+  runtime.root.visible = runtime.loaded;
+  runtime.standRoot.visible = runtime.loaded;
+  runtime.standRoot.scale.setScalar(1);
+  runtime.modelVisible = runtime.loaded;
+  runtime.vfx.group.visible = false;
 }
 
 function updateMascotVfx(runtime: ActiveImageRuntime, frameTime: number) {
@@ -750,31 +743,6 @@ function updateMascotVfx(runtime: ActiveImageRuntime, frameTime: number) {
     return true;
   }
 
-  if (runtime.disappearStartedAt !== null) {
-    const elapsed = frameTime - runtime.disappearStartedAt;
-    const progress = MathUtils.clamp(elapsed / DISAPPEAR_VFX_DURATION_MS, 0, 1);
-
-    runtime.vfx.group.visible = progress < 1;
-    runtime.vfx.auraMaterial.opacity = 1.25 * (1 - progress);
-    runtime.vfx.aura.scale.setScalar(0.75 + progress * 2.65);
-    runtime.vfx.particleMaterial.opacity = 1 * (1 - progress);
-    runtime.vfx.particles.scale.setScalar(0.72 + progress * 2.45);
-
-    if (progress >= 1) {
-      runtime.disappearStartedAt = null;
-      runtime.vfx.group.visible = false;
-
-      if (!runtime.visible) {
-        runtime.root.visible = false;
-        runtime.poseInitialized = false;
-      }
-
-      return false;
-    }
-
-    return true;
-  }
-
   runtime.vfx.group.visible = false;
   return false;
 }
@@ -793,63 +761,16 @@ function getOvershootScale(progress: number) {
   return APPEAR_MODEL_START_SCALE + (1 - APPEAR_MODEL_START_SCALE) * eased + overshoot;
 }
 
-function updateRuntimePose(
-  runtime: ActiveImageRuntime,
-  delta: number,
-  position: Vector3,
-  quaternion: Quaternion,
-  scale: Vector3,
-  uniformScale: Vector3
-) {
-  runtime.anchor.group.updateMatrixWorld(true);
-  runtime.anchor.group.matrixWorld.decompose(position, quaternion, scale);
-
-  uniformScale.setScalar(getStableAnchorScale(scale));
-
-  if (!runtime.poseInitialized) {
-    runtime.root.position.copy(position);
-    runtime.root.quaternion.copy(quaternion);
-    runtime.root.scale.copy(uniformScale);
-    runtime.poseInitialized = true;
-    return;
-  }
-
-  runtime.root.position.lerp(position, getFrameAlpha(delta, POSITION_SMOOTHING_SPEED));
-  runtime.root.quaternion.slerp(quaternion, getFrameAlpha(delta, ROTATION_SMOOTHING_SPEED));
-  runtime.root.scale.lerp(uniformScale, getFrameAlpha(delta, SCALE_SMOOTHING_SPEED));
-}
-
-function getStableAnchorScale(scale: Vector3) {
-  const uniformScale = Math.sqrt(Math.abs(scale.x * scale.y));
-
-  if (!Number.isFinite(uniformScale) || uniformScale <= 0) {
-    return 1;
-  }
-
-  return MathUtils.clamp(uniformScale, MIN_ANCHOR_UNIFORM_SCALE, MAX_ANCHOR_UNIFORM_SCALE);
-}
-
-function getFrameAlpha(delta: number, speed: number) {
-  return 1 - Math.exp(-speed * Math.min(delta, MAX_POSE_DELTA_SECONDS));
-}
-
 const MAX_SIMULTANEOUS_IMAGE_TARGETS = 2;
-const TRACKING_FILTER_MIN_CUTOFF = 0.004;
-const TRACKING_FILTER_BETA = 80;
+const TRACKING_FILTER_MIN_CUTOFF = 0.001;
+const TRACKING_FILTER_BETA = 1000;
 const TRACKING_WARMUP_TOLERANCE = 3;
-const TRACKING_MISS_TOLERANCE = 5;
+const TRACKING_MISS_TOLERANCE = 4;
 const IMAGE_TARGET_STAND_ROTATION_RADIANS = MathUtils.degToRad(90);
 const APPEAR_MODEL_DELAY_MS = 150;
 const APPEAR_MODEL_GROW_DURATION_MS = 360;
 const APPEAR_MODEL_START_SCALE = 0.18;
 const APPEAR_MODEL_OVERSHOOT = 0.12;
 const APPEAR_VFX_DURATION_MS = 700;
-const DISAPPEAR_VFX_DURATION_MS = 340;
 const AURA_TEXTURE_SIZE = 128;
 const VFX_PARTICLE_COUNT = 72;
-const POSITION_SMOOTHING_SPEED = 18;
-const ROTATION_SMOOTHING_SPEED = 18;
-const SCALE_SMOOTHING_SPEED = 7;
-const MAX_POSE_DELTA_SECONDS = 1 / 20;
-const MIN_ANCHOR_UNIFORM_SCALE = 0.001;
-const MAX_ANCHOR_UNIFORM_SCALE = 1000;

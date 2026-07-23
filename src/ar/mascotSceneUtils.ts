@@ -12,7 +12,10 @@ import {
 } from "three";
 
 export const MASCOT_FORWARD_YAW_OFFSET = -Math.PI / 2;
-export const MASCOT_TARGET_HEIGHT_METERS = 1.4;
+const BASE_MASCOT_TARGET_HEIGHT_METERS = 1.4;
+export const MASCOT_SCALE_MULTIPLIER = 0.9;
+export const MASCOT_TARGET_HEIGHT_METERS =
+  BASE_MASCOT_TARGET_HEIGHT_METERS * MASCOT_SCALE_MULTIPLIER;
 
 interface ModelAlignmentOptions {
   defaultScale: number;
